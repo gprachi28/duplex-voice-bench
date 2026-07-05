@@ -38,7 +38,7 @@ and receives decoded audio frames. FastAPI runs as a sidecar for `/metrics` and
 `/health` only — audio does not flow through it.
 
 ```
-Browser (LiveKit Web SDK, hosted on Vercel)
+Browser (LiveKit Web SDK, local HTML/JS in repo)
       │
       │  WebRTC (Opus over UDP)
       ▼
@@ -78,7 +78,7 @@ Browser (LiveKit Web SDK, hosted on Vercel)
 └─────────────────────────────────────────────────┘
 
 ┌──────────────────────┐
-│  FastAPI sidecar     │  /metrics, /health only
+│  FastAPI sidecar     │  /token, /metrics, /health (localhost bind)
 └──────────────────────┘
 ```
 
@@ -100,9 +100,12 @@ server, LiveKit Web SDK on the client. Rationale:
 - Room-based JWT tokens provide authentication out of the box, closing the auth
   gap on a public demo.
 
-**Client:** minimal LiveKit Web SDK page hosted on Vercel — connects to a room,
-shows live transcript and per-stage latency HUD, exposes the backend selector.
-No Gradio, no HuggingFace Spaces.
+**Client:** minimal LiveKit Web SDK page shipped as a local HTML/JS file in the
+repo. Connects to a room, shows live transcript and per-stage latency HUD,
+exposes the backend selector. No Vercel, no Gradio, no HuggingFace Spaces —
+the primary demo artifact is a set of recorded videos. Live access is
+credential-gated: run the repo locally with your own API keys, or with a
+temporary invite code shared out-of-band.
 
 **Server:** `livekit-agents` worker runs on the M4 Pro. LiveKit dispatches an
 incoming room to the worker; the worker joins as a participant and receives
@@ -314,21 +317,30 @@ the audio queue. This is documented as a known limitation — not a missing over
 
 ## Demo
 
-**LiveKit Cloud + custom Web SDK page on Vercel.** Shareable URL, no setup for
-the recruiter, WebRTC-quality audio.
+**Primary artifact: recorded video walkthroughs.** Each backend combination gets
+its own video showing the same prompts, per-stage latency HUD, and audio quality
+side by side. Videos live in `demos/` and are linked from the README + benchmark
+report.
 
-Client is a minimal single-page app using the LiveKit Web SDK:
+**Live access is credential-gated.** No public deploy, no public URL. Someone
+who wants to try it live either:
+- clones the repo, brings their own OpenAI / ElevenLabs / LiveKit keys, runs
+  the stack locally; or
+- gets a temporary invite code shared out-of-band, runs the shipped local
+  client HTML against a LiveKit room I spin up on demand.
+
+The rationale is cost control: no public `/token` endpoint means no scraper,
+no bot, and no accidental $500 OpenAI bill from a viral demo.
+
+The local client HTML (in-repo) uses the LiveKit Web SDK and shows:
 - Connect / disconnect from the room
 - Live transcript as speech is recognised
 - Per-stage latency breakdown in real time (fed via LiveKit data channel from
   the agent worker)
 - Active combination selector — swap STT/TTS backends from the UI, mid-session
 
-The combination selector makes the benchmark interactive — a recruiter can switch
-from Cohere Transcribe to `mlx-whisper` and hear the quality difference live.
-
-The agent worker runs on the M4 Pro; LiveKit Cloud handles routing, so the
-demo works from anywhere without exposing the local machine.
+The combination selector is the thing that makes videos worth watching: same
+prompt, different backend, audibly different result.
 
 ---
 
@@ -340,8 +352,9 @@ demo works from anywhere without exposing the local machine.
 | Cohere Transcribe SDK maturity | Unstable API surface | Abstract behind interface; easy to swap |
 | Sentence buffer adds latency | First TTS flush delayed | Tune minimum flush size; measure tradeoff |
 | Smart Turn false positives | Premature cutoff | Expose confidence threshold as config; benchmark against silence baseline |
-| LiveKit Cloud free tier limits | Demo unavailable if exhausted | 5000 conn-min/month is >20h of demo talk time; upgrade or self-host if hit |
-| Agent worker down = demo down | Local M4 must be reachable to LiveKit | Worker connects out to LiveKit Cloud; no inbound port needed. Restart via `launchd` |
+| LiveKit Cloud free tier limits | Live demos unavailable if exhausted | 5000 conn-min/month is >20h of talk time; videos are the primary artifact, so exhaustion only blocks credentialed live sessions |
+| Agent worker down = live demo down | Local M4 must be running for live access | Worker connects out to LiveKit Cloud; no inbound port needed. Video demos unaffected |
+| No public deploy = cannot try before asking | Recruiter friction | Video demos front the README; live access is a one-email ask |
 
 ---
 
@@ -359,8 +372,9 @@ demo works from anywhere without exposing the local machine.
   endpoint, not bolted on after the fact.
 - **Cohere Transcribe** — SOTA WER (5.42%), Apache 2.0, released March 2026.
   Minimal portfolio coverage at this date.
-- **Live interactive demo** — backend selector in the LiveKit Web SDK client lets
-  anyone experience the latency/quality tradeoff in real time.
+- **Video-first demo, credential-gated live access** — the primary artifact is a
+  set of recorded videos comparing backend combinations on identical prompts.
+  Live access is invite-code gated to keep API spend bounded.
 - **WebRTC transport** — production-grade audio (jitter buffer, loss recovery)
   via LiveKit Cloud, not hand-rolled WebSocket + PCM.
 
