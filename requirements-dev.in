@@ -1,0 +1,2 @@
+# Dev-only deps. Compile with: pip-compile requirements-dev.in
+pytest
