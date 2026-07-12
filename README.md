@@ -5,15 +5,17 @@ architecture spec; this README documents only what is built and verified.
 
 ## What works today
 
-An echo loop that proves the transport trunk end-to-end:
+An echo loop with Silero VAD observation on the normalised buffer:
 
 - Browser mic → LiveKit Cloud → `livekit-agents` worker (Python, M4 Pro)
 - Every incoming audio frame is normalised at ingress to **16 kHz mono
   float32** (the format contract every downstream ML stage will consume)
-- The worker republishes the normalised audio back into the room
+- The worker republishes the normalised audio back into the room (echo)
+- **Silero VAD** runs alongside on the same normalised buffer and logs
+  `SPEECH_START` / `SPEECH_END` events during utterances
 - Browser plays the echo through the same LiveKit connection
 
-No VAD, STT, LLM, or TTS yet — those plug into the normalised buffer.
+No STT, LLM, or TTS yet — those plug into the normalised buffer.
 
 ## Layout
 
@@ -21,6 +23,7 @@ No VAD, STT, LLM, or TTS yet — those plug into the normalised buffer.
 agent/
   __init__.py
   audio.py            # to_16k_mono_f32 — the ingress format contract
+  vad.py              # Silero VAD config + process-wide singleton
   worker.py           # livekit-agents echo-loop worker
 client/
   index.html          # LiveKit Web SDK demo client
