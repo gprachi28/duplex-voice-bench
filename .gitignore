@@ -42,6 +42,7 @@ Thumbs.db
 
 # Private design docs (personal, not for this repo)
 docs/superpowers/
+understanding.md
 
 # Build / logs
 dist/
