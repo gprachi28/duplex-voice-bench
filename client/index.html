@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Voice Agent — Echo Loop</title>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    button { padding: 0.5rem 1rem; margin-right: 0.5rem; font-size: 1rem; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { margin-top: 1rem; padding: 0.5rem 0.75rem; background: #f0f0f0; border-radius: 4px; }
+    #log { margin-top: 1rem; padding: 0.5rem 0.75rem; background: #111; color: #0f0; font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; min-height: 6rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Voice Agent — Echo Loop</h1>
+  <p>Click <b>Connect</b>, allow mic access, then speak. The agent worker echoes your audio back.</p>
+  <button id="connectBtn">Connect</button>
+  <button id="disconnectBtn" disabled>Disconnect</button>
+  <div id="status">idle</div>
+  <div id="audioSink"></div>
+  <div id="log"></div>
+
+  <script>
+    const { Room, RoomEvent, Track } = LivekitClient;
+
+    const ROOM = "echo-test";
+    const $status = document.getElementById("status");
+    const $log = document.getElementById("log");
+    const $audio = document.getElementById("audioSink");
+    const $connect = document.getElementById("connectBtn");
+    const $disconnect = document.getElementById("disconnectBtn");
+
+    let room = null;
+
+    // Append a timestamped line to the on-page log.
+    function log(msg) {
+      const t = new Date().toISOString().slice(11, 19);
+      $log.textContent += `${t}  ${msg}\n`;
+    }
+
+    async function connect() {
+      $connect.disabled = true;
+      try {
+        $status.textContent = "fetching token…";
+        const identity = "user-" + Math.random().toString(36).slice(2, 8);
+        const res = await fetch("/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ room: ROOM, identity }),
+        });
+        if (!res.ok) throw new Error(`token endpoint returned ${res.status}`);
+        const { token, url } = await res.json();
+        log(`token ok, url=${url}`);
+
+        $status.textContent = "connecting to room…";
+        room = new Room();
+
+        // Play any remote audio track that gets subscribed (the agent's echo).
+        room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+          if (track.kind === Track.Kind.Audio) {
+            log(`subscribed audio from ${participant.identity}`);
+            $audio.appendChild(track.attach());
+          }
+        });
+        room.on(RoomEvent.Disconnected, (reason) => {
+          log(`room disconnected (reason=${reason})`);
+          $status.textContent = "disconnected";
+        });
+        room.on(RoomEvent.ConnectionStateChanged, (state) => {
+          log(`connection state: ${state}`);
+        });
+
+        await room.connect(url, token);
+        log(`joined room "${ROOM}" as ${identity}`);
+
+        $status.textContent = "requesting mic…";
+        await room.localParticipant.setMicrophoneEnabled(true);
+        log("mic published");
+
+        $status.textContent = `connected as ${identity}`;
+        $disconnect.disabled = false;
+      } catch (err) {
+        log(`ERROR: ${err.message || err}`);
+        $status.textContent = `failed: ${err.message || err}`;
+        $connect.disabled = false;
+        if (room) { await room.disconnect().catch(() => {}); room = null; }
+      }
+    }
+
+    async function disconnect() {
+      $disconnect.disabled = true;
+      if (room) {
+        await room.disconnect();
+        room = null;
+      }
+      $audio.replaceChildren();
+      $connect.disabled = false;
+      $status.textContent = "idle";
+    }
+
+    $connect.onclick = connect;
+    $disconnect.onclick = disconnect;
+  </script>
+</body>
+</html>
