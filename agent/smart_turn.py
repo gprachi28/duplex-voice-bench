@@ -8,6 +8,7 @@ consult on Silero END_OF_SPEECH.
 
 from __future__ import annotations
 
+import os
 import threading
 
 import numpy as np
@@ -16,6 +17,7 @@ import onnxruntime as ort
 from agent.whisper_features import compute_whisper_log_mel_features
 
 WINDOW_SAMPLES = 8 * 16_000  # 8 s at 16 kHz, matches the model's rolling window
+SCORE_INTERVAL_S = 0.1
 
 
 class _RingBuffer:
@@ -92,3 +94,55 @@ class SmartTurnScorer:
         input_features = features[np.newaxis, :, :]
         (logits,) = self._session.run(None, {"input_features": input_features})
         return float(1.0 / (1.0 + np.exp(-logits[0, 0])))
+
+
+class SmartTurnObserver:
+    """Feeds a live ring buffer and re-scores it on a background thread.
+
+    Push normalised 16 kHz mono float32 frames via `push`; a background
+    thread re-scores the trailing 8 s window every `interval_s` and exposes
+    the latest completion probability via `latest_probability` for the
+    pipeline to consult on Silero END_OF_SPEECH.
+    """
+
+    def __init__(self, scorer: SmartTurnScorer, interval_s: float = SCORE_INTERVAL_S) -> None:
+        self._buffer = _RingBuffer(size=WINDOW_SAMPLES)
+        self._scorer = scorer
+        self._interval_s = interval_s
+        self._latest_probability = 0.0
+        self._probability_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def push(self, samples: np.ndarray) -> None:
+        self._buffer.push(samples)
+
+    @property
+    def latest_probability(self) -> float:
+        with self._probability_lock:
+            return self._latest_probability
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_s):
+            probability = self._scorer.score(self._buffer.snapshot())
+            with self._probability_lock:
+                self._latest_probability = probability
+
+
+_scorer_instance: SmartTurnScorer | None = None
+
+
+def create_smart_turn_scorer() -> SmartTurnScorer:
+    """Return the process-wide SmartTurnScorer, loading it on first call."""
+    global _scorer_instance
+    if _scorer_instance is None:
+        model_path = os.environ["SMART_TURN_MODEL_PATH"]
+        _scorer_instance = SmartTurnScorer(model_path)
+    return _scorer_instance
