@@ -26,29 +26,48 @@ pipeline classifies correctly, and a live LiveKit session confirmed the
 worker logs a varied, non-constant probability per turn (`0.01`–`0.95`
 across 5 turns in one run).
 
-No STT, LLM, or TTS yet — those plug into the normalised buffer. Smart Turn
-is an observer only: nothing downstream consumes its probability yet.
+- **mlx-whisper STT** now consumes the gate's decision: on `SPEECH_END`,
+  if Smart Turn's completion probability is above threshold the
+  accumulated utterance is transcribed (`large-v3`, Metal-accelerated);
+  if it's below threshold, the pipeline logs "turn incomplete, continuing
+  to listen" and keeps accumulating audio across the next speech segment
+  instead of firing early. A 30s safety valve force-fires STT if Smart
+  Turn never confirms completion, so one confused turn can't hang the
+  pipeline
+
+Verified live: a sentence spoken with a mid-sentence pause was correctly
+suppressed and stitched across three VAD segments into one accurate
+transcript, and continuous unbroken speech past the safety-valve cap
+correctly force-fired STT with a logged warning.
+
+No LLM or TTS yet — those plug into the transcript. STT output is
+log-only for now (no downstream consumer, no client-visible transcript).
 
 ## Layout
 
 ```
 agent/
   __init__.py
-  audio.py             # to_16k_mono_f32 — the ingress format contract
-  vad.py               # Silero VAD config + process-wide singleton
-  smart_turn.py        # ring buffer, ONNX scorer, background observer
-  whisper_features.py  # vendored numpy-only log-mel feature extraction
-  worker.py            # livekit-agents echo-loop worker
+  audio.py              # to_16k_mono_f32 — the ingress format contract
+  vad.py                # Silero VAD config + process-wide singleton
+  smart_turn.py         # ring buffer, ONNX scorer, background observer
+  turn_gate.py          # utterance accumulation + Smart Turn-gated firing decision
+  stt.py                # STTBackend protocol + mlx-whisper implementation
+  whisper_features.py   # vendored numpy-only log-mel feature extraction
+  worker.py             # livekit-agents worker: echo, VAD, Smart Turn, gated STT
 client/
   index.html          # LiveKit Web SDK demo client
 server/
   main.py             # FastAPI sidecar: /token, /health, GET / serves the client
 tests/
-  test_audio.py               # 5 contract tests for the ingress function
-  test_smart_turn_buffer.py   # ring buffer unit tests
-  test_smart_turn_model.py    # ONNX inference against recorded fixtures
-  test_smart_turn_observer.py # background-thread scoring behaviour
-  fixtures/smart_turn/        # complete.wav / incomplete.wav
+  test_audio.py                    # 5 contract tests for the ingress function
+  test_smart_turn_buffer.py        # ring buffer unit tests
+  test_smart_turn_model.py         # ONNX inference against recorded fixtures
+  test_smart_turn_observer.py      # background-thread scoring behaviour
+  test_turn_gate.py                # utterance accumulation + gating decision
+  test_turn_gate_smart_turn.py     # gate decisions against real Smart Turn scores
+  test_stt_backend.py              # mlx-whisper transcription against recorded fixtures
+  fixtures/smart_turn/             # complete.wav / incomplete.wav
 design.md             # architecture spec (source of truth)
 requirements.txt      # runtime deps (livekit-agents, fastapi, etc.)
 requirements-dev.in   # dev deps (pytest)
@@ -91,6 +110,14 @@ huggingface-cli download onnx-community/smart-turn-v3-ONNX \
   --include "onnx/model.onnx" --local-dir models/smart-turn-v3
 ```
 
+### mlx-whisper STT weights
+
+No manual download step — `mlx-whisper` resolves and caches
+`mlx-community/whisper-large-v3-mlx` from the HF Hub itself on first use
+(a few GB, cached under `~/.cache/huggingface`, not `models/`). The first
+transcription after a fresh install or cache clear will be slow while it
+downloads; subsequent runs are fast.
+
 ## Run the echo loop
 
 Two processes, one machine.
@@ -114,9 +141,12 @@ You should hear yourself echoed back with 200–400 ms of round-trip latency.
 python -m pytest tests/
 ```
 
-`test_smart_turn_model.py` skips unless `SMART_TURN_MODEL_PATH` is set (see
-above):
+`test_smart_turn_model.py` and `test_turn_gate_smart_turn.py` skip unless
+`SMART_TURN_MODEL_PATH` is set (see above):
 
 ```bash
 SMART_TURN_MODEL_PATH=models/smart-turn-v3/onnx/model.onnx python -m pytest tests/
 ```
+
+`test_stt_backend.py` skips on non-Apple-Silicon machines and downloads the
+`large-v3` weights on first run (see "mlx-whisper STT weights" above).
