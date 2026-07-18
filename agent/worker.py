@@ -18,6 +18,7 @@ from livekit import agents, rtc
 from livekit.agents.vad import VADEventType
 
 from agent.audio import TARGET_SR, to_16k_mono_f32
+from agent.llm import LLMBackend, create_llm_backend
 from agent.smart_turn import SmartTurnObserver, create_smart_turn_scorer
 from agent.stt import STTBackend, create_stt_backend
 from agent.turn_gate import Continue, ForceFire, GateResult, TurnGate, create_turn_gate
@@ -78,13 +79,36 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     turn_observer.start()
     turn_gate = create_turn_gate()
     stt_backend = create_stt_backend()
+    llm_backend = create_llm_backend()
+    # Session-scoped, NOT a singleton like the backends above -- a fresh
+    # list/lock per room job, or history would leak across rooms.
+    history: list[dict[str, str]] = []
+    history_lock = asyncio.Lock()
 
     vad_stream = create_vad().stream()
     vad_task = asyncio.create_task(
-        _consume_vad_events(vad_stream, turn_observer, turn_gate, stt_backend)
+        _consume_vad_events(
+            vad_stream,
+            turn_observer,
+            turn_gate,
+            stt_backend,
+            llm_backend,
+            history,
+            history_lock,
+        )
     )
     echo_task = asyncio.create_task(
-        _echo(remote_track, source, vad_stream, turn_observer, turn_gate, stt_backend)
+        _echo(
+            remote_track,
+            source,
+            vad_stream,
+            turn_observer,
+            turn_gate,
+            stt_backend,
+            llm_backend,
+            history,
+            history_lock,
+        )
     )
     left_task = asyncio.create_task(user_left.wait())
 
@@ -108,6 +132,9 @@ async def _echo(
     turn_observer: SmartTurnObserver,
     turn_gate: TurnGate,
     stt_backend: STTBackend,
+    llm_backend: LLMBackend,
+    history: list[dict[str, str]],
+    history_lock: asyncio.Lock,
 ) -> None:
     """Read frames, normalise, republish, and mirror into the VAD stream,
     the Smart Turn ring buffer, and the turn gate's utterance buffer."""
@@ -124,7 +151,11 @@ async def _echo(
             # Max utterance duration crossed — force-fire without waiting
             # for a Silero END_OF_SPEECH a long monologue might never produce.
             result = turn_gate.evaluate(turn_observer.latest_probability)
-            asyncio.create_task(_dispatch_gate_result(result, stt_backend))
+            asyncio.create_task(
+                _dispatch_gate_result(
+                    result, stt_backend, llm_backend, history, history_lock
+                )
+            )
 
         # Float32 [-1, +1] → int16 for the outbound wire format.
         out = np.clip(mono_16k * 32767.0, -32768, 32767).astype(np.int16)
@@ -149,6 +180,9 @@ async def _consume_vad_events(
     turn_observer: SmartTurnObserver,
     turn_gate: TurnGate,
     stt_backend: STTBackend,
+    llm_backend: LLMBackend,
+    history: list[dict[str, str]],
+    history_lock: asyncio.Lock,
 ) -> None:
     """Log Silero VAD speech-boundary events, consulting the Smart Turn
     completion probability at END_OF_SPEECH to decide — via TurnGate —
@@ -168,15 +202,32 @@ async def _consume_vad_events(
                 prob,
             )
             result = turn_gate.evaluate(prob)
-            asyncio.create_task(_dispatch_gate_result(result, stt_backend))
+            asyncio.create_task(
+                _dispatch_gate_result(
+                    result, stt_backend, llm_backend, history, history_lock
+                )
+            )
         elif event.type == VADEventType.INFERENCE_DONE and not first_inference_logged:
             logger.info("VAD first inference: prob=%.2f", event.probability)
             first_inference_logged = True
 
 
-async def _dispatch_gate_result(result: GateResult, stt_backend: STTBackend) -> None:
+async def _dispatch_gate_result(
+    result: GateResult,
+    stt_backend: STTBackend,
+    llm_backend: LLMBackend,
+    history: list[dict[str, str]],
+    history_lock: asyncio.Lock,
+) -> None:
     """Handle a TurnGate decision: log-and-return on Continue, transcribe
-    and log the transcript on Fire/ForceFire."""
+    and log the transcript on Fire/ForceFire, then stream an LLM reply.
+
+    history_lock serializes "append user turn -> stream reply -> append
+    assistant turn": TurnGate lets a new utterance start firing dispatch
+    tasks while a prior turn's LLM stream is still running (nothing stops
+    overlapping Fire/ForceFire events), and without a lock two concurrent
+    tasks could interleave appends to the shared history list.
+    """
     if isinstance(result, Continue):
         logger.info("turn incomplete, continuing to listen")
         return
@@ -191,15 +242,39 @@ async def _dispatch_gate_result(result: GateResult, stt_backend: STTBackend) -> 
         return
     logger.info("TRANSCRIPT (%s): %r", "forced" if forced else "confirmed", text)
 
+    if history_lock.locked():
+        logger.warning("overlapping turn: waiting for prior LLM reply to finish")
+    async with history_lock:
+        history.append({"role": "user", "content": text})
+        try:
+            start = time.monotonic()
+            first_chunk = True
+            chunks: list[str] = []
+            async for chunk in llm_backend.stream_chat(history):
+                if first_chunk:
+                    logger.info("LLM TTFT: %.3fs", time.monotonic() - start)
+                    first_chunk = False
+                chunks.append(chunk)
+        except Exception:
+            # The user turn stays in history unanswered; the next turn's
+            # request will just include two consecutive user messages,
+            # which chat-tuned models tolerate.
+            logger.exception("LLM streaming failed")
+            return
+        response = "".join(chunks)
+        history.append({"role": "assistant", "content": response})
+        logger.info("LLM RESPONSE: %r", response)
+
 
 def _prewarm(proc: agents.JobProcess) -> None:
-    """Runs in each subprocess before entrypoint so Silero, Smart Turn, and
-    the STT backend are already loaded."""
+    """Runs in each subprocess before entrypoint so Silero, Smart Turn, STT,
+    and the LLM backend are already loaded/constructed."""
     create_vad()
     create_smart_turn_scorer()
     create_stt_backend()
+    create_llm_backend()
     logger.info(
-        "Silero VAD + Smart Turn + STT preloaded (pid=%d)",
+        "Silero VAD + Smart Turn + STT + LLM preloaded (pid=%d)",
         proc.pid if hasattr(proc, "pid") else 0,
     )
 
