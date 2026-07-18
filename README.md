@@ -40,8 +40,15 @@ suppressed and stitched across three VAD segments into one accurate
 transcript, and continuous unbroken speech past the safety-valve cap
 correctly force-fired STT with a logged warning.
 
-No LLM or TTS yet — those plug into the transcript. STT output is
-log-only for now (no downstream consumer, no client-visible transcript).
+- **Ollama LLM** (`llama3.2:3b`, local, streaming) now consumes the
+  transcript: each confirmed or forced transcript is appended to a
+  per-room conversation history and sent to Ollama's `/api/chat`, and the
+  streamed reply is logged token-by-token alongside a TTFT (time to first
+  token) metric. History is multi-turn (the model sees prior turns in the
+  same room session) and resets automatically when the room session ends.
+
+No TTS yet — the LLM's streamed reply is log-only for now (no
+client-visible voice response).
 
 ## Layout
 
@@ -53,8 +60,9 @@ agent/
   smart_turn.py         # ring buffer, ONNX scorer, background observer
   turn_gate.py          # utterance accumulation + Smart Turn-gated firing decision
   stt.py                # STTBackend protocol + mlx-whisper implementation
+  llm.py                # LLMBackend protocol + streaming Ollama implementation
   whisper_features.py   # vendored numpy-only log-mel feature extraction
-  worker.py             # livekit-agents worker: echo, VAD, Smart Turn, gated STT
+  worker.py             # livekit-agents worker: echo, VAD, Smart Turn, gated STT + LLM
 client/
   index.html          # LiveKit Web SDK demo client
 server/
@@ -67,6 +75,8 @@ tests/
   test_turn_gate.py                # utterance accumulation + gating decision
   test_turn_gate_smart_turn.py     # gate decisions against real Smart Turn scores
   test_stt_backend.py              # mlx-whisper transcription against recorded fixtures
+  test_llm_backend.py              # Ollama streaming chat against a real local server
+  test_worker_dispatch.py          # history + lock bookkeeping against fake backends
   fixtures/smart_turn/             # complete.wav / incomplete.wav
 design.md             # architecture spec (source of truth)
 requirements.txt      # runtime deps (livekit-agents, fastapi, etc.)
@@ -118,6 +128,21 @@ No manual download step — `mlx-whisper` resolves and caches
 transcription after a fresh install or cache clear will be slow while it
 downloads; subsequent runs are fast.
 
+### Ollama LLM setup
+
+Install Ollama and pull the model this project uses:
+
+```bash
+brew install ollama
+ollama serve &
+ollama pull llama3.2:3b
+```
+
+The worker talks to Ollama over HTTP at `OLLAMA_HOST` (defaults to
+`http://localhost:11434` if unset in `.env`). If Ollama isn't running,
+the worker still starts — the LLM call simply fails and is logged as an
+exception (`LLM streaming failed`) rather than crashing the pipeline.
+
 ## Run the echo loop
 
 Two processes, one machine.
@@ -150,3 +175,6 @@ SMART_TURN_MODEL_PATH=models/smart-turn-v3/onnx/model.onnx python -m pytest test
 
 `test_stt_backend.py` skips on non-Apple-Silicon machines and downloads the
 `large-v3` weights on first run (see "mlx-whisper STT weights" above).
+
+`test_llm_backend.py` skips unless Ollama is reachable at `OLLAMA_HOST`
+(see "Ollama LLM setup" above).
