@@ -47,6 +47,15 @@ correctly force-fired STT with a logged warning.
   token) metric. History is multi-turn (the model sees prior turns in the
   same room session) and resets automatically when the room session ends.
 
+Verified live: a multi-turn conversation confirmed the model correctly
+recalled an earlier turn's content when answering a later turn, proving
+history is actually threaded through the LLM call rather than only
+logged. The same run also exercised the `asyncio.Lock` concurrency guard
+against a real race — a spurious empty-transcript dispatch overlapped
+with a genuine follow-up question, logged `overlapping turn: waiting
+for prior LLM reply to finish`, and both turns still completed and
+appended to history in the correct order.
+
 No TTS yet — the LLM's streamed reply is log-only for now (no
 client-visible voice response).
 
