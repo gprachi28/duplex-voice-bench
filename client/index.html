@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Voice Agent — Echo Loop</title>
+  <title>Voice Agent</title>
   <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
@@ -13,8 +13,8 @@
   </style>
 </head>
 <body>
-  <h1>Voice Agent — Echo Loop</h1>
-  <p>Click <b>Connect</b>, allow mic access, then speak. The agent worker echoes your audio back.</p>
+  <h1>Voice Agent</h1>
+  <p>Click <b>Connect</b>, allow mic access, then speak. The agent transcribes your turn and replies out loud.</p>
   <button id="connectBtn">Connect</button>
   <button id="disconnectBtn" disabled>Disconnect</button>
   <div id="status">idle</div>
@@ -56,7 +56,7 @@
         $status.textContent = "connecting to room…";
         room = new Room();
 
-        // Play any remote audio track that gets subscribed (the agent's echo).
+        // Play any remote audio track that gets subscribed (the agent's TTS reply).
         room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
           if (track.kind === Track.Kind.Audio) {
             log(`subscribed audio from ${participant.identity}`);

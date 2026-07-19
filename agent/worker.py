@@ -1,38 +1,45 @@
-"""Echo-loop agent worker with Silero VAD, Smart Turn, and gated STT.
+"""Voice agent worker: Silero VAD, Smart Turn, gated STT, streaming LLM,
+and sentence-buffered TTS.
 
 Joins a LiveKit room dispatched to us, subscribes to the first remote audio
-track, runs every incoming frame through the ingress format contract
-(16 kHz mono float32), and republishes the same audio back into the room.
-Silero VAD and Smart Turn observe the same normalised buffer the echo
-consumes; TurnGate consults both to decide when an utterance is actually
-ready to transcribe.
+track, and runs every incoming frame through the ingress format contract
+(16 kHz mono float32) to feed Silero VAD and Smart Turn. TurnGate consults
+both to decide when an utterance is ready to transcribe; a confirmed
+transcript goes to the LLM, whose streamed reply is flushed sentence-by-
+sentence to TTS and published back into the room as the agent's spoken
+reply.
 """
 
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 
 import numpy as np
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents.vad import VADEventType
 
-from agent.audio import TARGET_SR, to_16k_mono_f32
+from agent.audio import to_16k_mono_f32
 from agent.llm import LLMBackend, create_llm_backend
+from agent.sentence_buffer import SentenceBuffer
 from agent.smart_turn import SmartTurnObserver, create_smart_turn_scorer
 from agent.stt import STTBackend, create_stt_backend
+from agent.tts import TTSBackend, create_tts_backend
 from agent.turn_gate import Continue, ForceFire, GateResult, TurnGate, create_turn_gate
 from agent.vad import create_vad
 
+PlayAudio = Callable[[np.ndarray], Awaitable[None]]
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("echo-worker")
+logger = logging.getLogger("voice-agent-worker")
 logger.setLevel(logging.INFO)
 
 # File handler so subprocess logs (dev-mode PROCESS executor) are visible
 # alongside the parent's. Guard against duplicate registration on re-import.
 if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
-    _fh = logging.FileHandler("/tmp/echo-worker.log")
+    _fh = logging.FileHandler("/tmp/voice-agent-worker.log")
     _fh.setFormatter(
         logging.Formatter("%(asctime)s %(process)d %(levelname)s %(message)s")
     )
@@ -40,9 +47,24 @@ if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
-    # Outbound track at the pipeline's canonical rate.
-    source = rtc.AudioSource(TARGET_SR, num_channels=1)
-    out_track = rtc.LocalAudioTrack.create_audio_track("echo-out", source)
+    tts_backend = create_tts_backend()
+
+    # Outbound track carries the synthesised TTS reply, at Kokoro's native rate.
+    source = rtc.AudioSource(tts_backend.sample_rate, num_channels=1)
+    out_track = rtc.LocalAudioTrack.create_audio_track("agent-reply", source)
+
+    async def play_audio(audio: np.ndarray) -> None:
+        if len(audio) == 0:
+            return
+        pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        await source.capture_frame(
+            rtc.AudioFrame(
+                data=pcm.tobytes(),
+                sample_rate=tts_backend.sample_rate,
+                num_channels=1,
+                samples_per_channel=len(pcm),
+            )
+        )
 
     # Set up track queue *before* connect so no early track is missed.
     remote_audio: asyncio.Queue[tuple[rtc.Track, rtc.RemoteParticipant]] = (
@@ -60,10 +82,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
     await ctx.room.local_participant.publish_track(out_track)
-    logger.info("joined room=%s, published echo track", ctx.room.name)
+    logger.info("joined room=%s, published agent-reply track", ctx.room.name)
 
     remote_track, remote_p = await remote_audio.get()
-    logger.info("echoing remote audio from %s", remote_p.identity)
+    logger.info("listening to remote audio from %s", remote_p.identity)
 
     # Register the leave handler now — filtered by identity so stale disconnect
     # events (from a previous browser session in the same room) can't fire it.
@@ -93,28 +115,31 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             turn_gate,
             stt_backend,
             llm_backend,
+            tts_backend,
             history,
             history_lock,
+            play_audio,
         )
     )
-    echo_task = asyncio.create_task(
-        _echo(
+    ingest_task = asyncio.create_task(
+        _ingest(
             remote_track,
-            source,
             vad_stream,
             turn_observer,
             turn_gate,
             stt_backend,
             llm_backend,
+            tts_backend,
             history,
             history_lock,
+            play_audio,
         )
     )
     left_task = asyncio.create_task(user_left.wait())
 
     try:
         _, pending = await asyncio.wait(
-            [echo_task, left_task], return_when=asyncio.FIRST_COMPLETED
+            [ingest_task, left_task], return_when=asyncio.FIRST_COMPLETED
         )
         for t in pending:
             t.cancel()
@@ -125,19 +150,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         logger.info("entrypoint done")
 
 
-async def _echo(
+async def _ingest(
     remote: rtc.RemoteAudioTrack,
-    source: rtc.AudioSource,
     vad_stream,
     turn_observer: SmartTurnObserver,
     turn_gate: TurnGate,
     stt_backend: STTBackend,
     llm_backend: LLMBackend,
+    tts_backend: TTSBackend,
     history: list[dict[str, str]],
     history_lock: asyncio.Lock,
+    play_audio: PlayAudio,
 ) -> None:
-    """Read frames, normalise, republish, and mirror into the VAD stream,
-    the Smart Turn ring buffer, and the turn gate's utterance buffer."""
+    """Read frames, normalise, and mirror into the VAD stream, the Smart
+    Turn ring buffer, and the turn gate's utterance buffer."""
     stream = rtc.AudioStream(remote, sample_rate=48_000, num_channels=1)
     frame_count, last_log = 0, time.monotonic()
 
@@ -153,25 +179,31 @@ async def _echo(
             result = turn_gate.evaluate(turn_observer.latest_probability)
             asyncio.create_task(
                 _dispatch_gate_result(
-                    result, stt_backend, llm_backend, history, history_lock
+                    result,
+                    stt_backend,
+                    llm_backend,
+                    tts_backend,
+                    history,
+                    history_lock,
+                    play_audio,
                 )
             )
 
-        # Float32 [-1, +1] → int16 for the outbound wire format.
-        out = np.clip(mono_16k * 32767.0, -32768, 32767).astype(np.int16)
-        out_frame = rtc.AudioFrame(
-            data=out.tobytes(),
-            sample_rate=TARGET_SR,
-            num_channels=1,
-            samples_per_channel=len(out),
+        # Float32 [-1, +1] → int16 so Silero gets its expected PCM frame.
+        pcm = np.clip(mono_16k * 32767.0, -32768, 32767).astype(np.int16)
+        vad_stream.push_frame(
+            rtc.AudioFrame(
+                data=pcm.tobytes(),
+                sample_rate=16_000,
+                num_channels=1,
+                samples_per_channel=len(pcm),
+            )
         )
-        await source.capture_frame(out_frame)
-        vad_stream.push_frame(out_frame)
 
         frame_count += 1
         now = time.monotonic()
         if now - last_log >= 2.0:
-            logger.info("echoed %d frames in %.1fs", frame_count, now - last_log)
+            logger.info("ingested %d frames in %.1fs", frame_count, now - last_log)
             frame_count, last_log = 0, now
 
 
@@ -181,8 +213,10 @@ async def _consume_vad_events(
     turn_gate: TurnGate,
     stt_backend: STTBackend,
     llm_backend: LLMBackend,
+    tts_backend: TTSBackend,
     history: list[dict[str, str]],
     history_lock: asyncio.Lock,
+    play_audio: PlayAudio,
 ) -> None:
     """Log Silero VAD speech-boundary events, consulting the Smart Turn
     completion probability at END_OF_SPEECH to decide — via TurnGate —
@@ -204,7 +238,13 @@ async def _consume_vad_events(
             result = turn_gate.evaluate(prob)
             asyncio.create_task(
                 _dispatch_gate_result(
-                    result, stt_backend, llm_backend, history, history_lock
+                    result,
+                    stt_backend,
+                    llm_backend,
+                    tts_backend,
+                    history,
+                    history_lock,
+                    play_audio,
                 )
             )
         elif event.type == VADEventType.INFERENCE_DONE and not first_inference_logged:
@@ -212,15 +252,35 @@ async def _consume_vad_events(
             first_inference_logged = True
 
 
+async def _synthesize_and_play(
+    tts_backend: TTSBackend, text: str, play_audio: PlayAudio
+) -> None:
+    """Synthesize one sentence-buffer-flushed segment and play it. A failed
+    segment is logged and skipped rather than aborting the turn -- the LLM
+    reply still lands in history even if TTS drops a sentence."""
+    try:
+        audio = await asyncio.to_thread(tts_backend.synthesize, text)
+    except Exception:
+        logger.exception("TTS synthesis failed for segment: %r", text)
+        return
+    logger.info(
+        "TTS segment (%.2fs audio): %r", len(audio) / tts_backend.sample_rate, text
+    )
+    await play_audio(audio)
+
+
 async def _dispatch_gate_result(
     result: GateResult,
     stt_backend: STTBackend,
     llm_backend: LLMBackend,
+    tts_backend: TTSBackend,
     history: list[dict[str, str]],
     history_lock: asyncio.Lock,
+    play_audio: PlayAudio,
 ) -> None:
     """Handle a TurnGate decision: log-and-return on Continue, transcribe
-    and log the transcript on Fire/ForceFire, then stream an LLM reply.
+    and log the transcript on Fire/ForceFire, then stream an LLM reply,
+    flushing it sentence-by-sentence to TTS as it arrives.
 
     history_lock serializes "append user turn -> stream reply -> append
     assistant turn": TurnGate lets a new utterance start firing dispatch
@@ -246,6 +306,7 @@ async def _dispatch_gate_result(
         logger.warning("overlapping turn: waiting for prior LLM reply to finish")
     async with history_lock:
         history.append({"role": "user", "content": text})
+        sentence_buffer = SentenceBuffer()
         try:
             start = time.monotonic()
             first_chunk = True
@@ -255,12 +316,17 @@ async def _dispatch_gate_result(
                     logger.info("LLM TTFT: %.3fs", time.monotonic() - start)
                     first_chunk = False
                 chunks.append(chunk)
+                for sentence in sentence_buffer.push(chunk):
+                    await _synthesize_and_play(tts_backend, sentence, play_audio)
         except Exception:
             # The user turn stays in history unanswered; the next turn's
             # request will just include two consecutive user messages,
             # which chat-tuned models tolerate.
             logger.exception("LLM streaming failed")
             return
+        remainder = sentence_buffer.flush()
+        if remainder:
+            await _synthesize_and_play(tts_backend, remainder, play_audio)
         response = "".join(chunks)
         history.append({"role": "assistant", "content": response})
         logger.info("LLM RESPONSE: %r", response)
@@ -268,13 +334,20 @@ async def _dispatch_gate_result(
 
 def _prewarm(proc: agents.JobProcess) -> None:
     """Runs in each subprocess before entrypoint so Silero, Smart Turn, STT,
-    and the LLM backend are already loaded/constructed."""
+    LLM, and TTS backends are already loaded/constructed.
+
+    TTS also gets one dummy synthesis call here: MLX lazily compiles
+    Kokoro's graph on the first real call (~2-3s cold vs. ~0.1-0.2s once
+    warm, measured), and prewarm exists precisely so that cost lands here
+    rather than mid-reply in a live conversation.
+    """
     create_vad()
     create_smart_turn_scorer()
     create_stt_backend()
     create_llm_backend()
+    create_tts_backend().synthesize("Ready.")
     logger.info(
-        "Silero VAD + Smart Turn + STT + LLM preloaded (pid=%d)",
+        "Silero VAD + Smart Turn + STT + LLM + TTS preloaded (pid=%d)",
         proc.pid if hasattr(proc, "pid") else 0,
     )
 
