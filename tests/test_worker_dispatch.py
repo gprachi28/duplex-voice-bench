@@ -1,10 +1,8 @@
-"""Pure unit tests for _dispatch_gate_result's LLM + TTS wiring -- fake
-STT/LLM/TTS backends, no real audio, no network. Exercises history
-bookkeeping, the sentence-buffer-gated TTS handoff, and the history_lock
-serialization documented in worker.py's docstring: TurnGate doesn't prevent
-a second Fire from spawning a second dispatch task while a prior one's LLM
-stream is still running, so the lock must keep concurrent turns from
-interleaving in the shared history list.
+"""Pure unit tests for _dispatch_gate_result's LLM + TTS + barge-in wiring
+-- fake STT/LLM/TTS backends, no real audio, no network. Exercises history
+bookkeeping, the sentence-buffer-gated TTS handoff, and barge-in: a new
+confirmed Fire/ForceFire cancels whatever reply is still in flight rather
+than waiting for it, per docs/superpowers/specs/2026-07-19-barge-in-design.md.
 """
 
 import asyncio
@@ -13,7 +11,7 @@ import numpy as np
 import pytest
 
 from agent.turn_gate import Continue, Fire
-from agent.worker import _dispatch_gate_result
+from agent.worker import ActiveReply, _dispatch_gate_result
 
 
 class FakeSTT:
@@ -25,15 +23,26 @@ class FakeSTT:
 
 
 class FakeLLM:
-    def __init__(self, chunks: list[str], delay_s: float = 0.0) -> None:
+    def __init__(
+        self,
+        chunks: list[str],
+        delay_s: float = 0.0,
+        cancel_log: list[str] | None = None,
+    ) -> None:
         self._chunks = chunks
         self._delay_s = delay_s
+        self._cancel_log = cancel_log
         self.calls: list[list[dict[str, str]]] = []
 
     async def stream_chat(self, messages):
         self.calls.append([dict(m) for m in messages])
         if self._delay_s:
-            await asyncio.sleep(self._delay_s)
+            try:
+                await asyncio.sleep(self._delay_s)
+            except asyncio.CancelledError:
+                if self._cancel_log is not None:
+                    self._cancel_log.append("llm_cancelled")
+                raise
         for chunk in self._chunks:
             yield chunk
 
@@ -59,6 +68,17 @@ def _recording_player(sink: list[np.ndarray]):
     return play
 
 
+def _noop_clear_audio() -> None:
+    pass
+
+
+def _recording_clear_audio(sink: list[str]):
+    def clear() -> None:
+        sink.append("clear_audio")
+
+    return clear
+
+
 def test_continue_result_skips_stt_llm_and_history():
     llm = FakeLLM(["should not be called"])
     tts = FakeTTS()
@@ -72,7 +92,9 @@ def test_continue_result_skips_stt_llm_and_history():
             tts,
             history,
             asyncio.Lock(),
+            ActiveReply(),
             _recording_player(played),
+            _noop_clear_audio,
         )
     )
     assert llm.calls == []
@@ -94,7 +116,9 @@ def test_fire_appends_user_then_assistant_turn():
             tts,
             history,
             asyncio.Lock(),
+            ActiveReply(),
             _recording_player(played),
+            _noop_clear_audio,
         )
     )
     assert history == [
@@ -119,7 +143,9 @@ def test_fire_sends_full_prior_history_to_llm():
             tts,
             history,
             asyncio.Lock(),
+            ActiveReply(),
             _recording_player(played),
+            _noop_clear_audio,
         )
     )
     assert llm.calls == [
@@ -129,52 +155,6 @@ def test_fire_sends_full_prior_history_to_llm():
             {"role": "user", "content": "new turn"},
         ]
     ]
-
-
-def test_overlapping_dispatches_serialize_and_preserve_turn_order(caplog):
-    slow_llm = FakeLLM(["slow-reply"], delay_s=0.2)
-    tts = FakeTTS()
-    played: list[np.ndarray] = []
-    history: list[dict[str, str]] = []
-    lock = asyncio.Lock()
-    play = _recording_player(played)
-
-    async def _run_both():
-        first = asyncio.create_task(
-            _dispatch_gate_result(
-                Fire(np.zeros(1, dtype=np.float32)),
-                FakeSTT("first"),
-                slow_llm,
-                tts,
-                history,
-                lock,
-                play,
-            )
-        )
-        await asyncio.sleep(0.05)
-        second = asyncio.create_task(
-            _dispatch_gate_result(
-                Fire(np.zeros(1, dtype=np.float32)),
-                FakeSTT("second"),
-                slow_llm,
-                tts,
-                history,
-                lock,
-                play,
-            )
-        )
-        await asyncio.gather(first, second)
-
-    with caplog.at_level("WARNING"):
-        asyncio.run(_run_both())
-
-    assert history == [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "slow-reply"},
-        {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "slow-reply"},
-    ]
-    assert any("overlapping turn" in r.message for r in caplog.records)
 
 
 def test_fire_flushes_tts_mid_stream_on_sentence_boundary_in_order():
@@ -190,7 +170,9 @@ def test_fire_flushes_tts_mid_stream_on_sentence_boundary_in_order():
             tts,
             history,
             asyncio.Lock(),
+            ActiveReply(),
             _recording_player(played),
+            _noop_clear_audio,
         )
     )
     assert tts.synthesized == ["This is one sentence.", "This is another sentence."]
@@ -211,7 +193,9 @@ def test_fire_keeps_history_when_tts_synthesis_fails(caplog):
                 tts,
                 history,
                 asyncio.Lock(),
+                ActiveReply(),
                 _recording_player(played),
+                _noop_clear_audio,
             )
         )
     assert history == [
@@ -219,3 +203,112 @@ def test_fire_keeps_history_when_tts_synthesis_fails(caplog):
         {"role": "assistant", "content": "Hello there, this is a longer reply."},
     ]
     assert played == []
+
+
+def test_barge_in_cancels_in_flight_reply_and_completes_new_turn(caplog):
+    call_order: list[str] = []
+    slow_llm = FakeLLM(["slow-reply"], delay_s=0.2, cancel_log=call_order)
+    tts = FakeTTS()
+    played: list[np.ndarray] = []
+    history: list[dict[str, str]] = []
+    lock = asyncio.Lock()
+    active_reply = ActiveReply()
+    play = _recording_player(played)
+    clear_audio = _recording_clear_audio(call_order)
+
+    async def _run_both():
+        first = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("first"),
+                slow_llm,
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                clear_audio,
+            )
+        )
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("second"),
+                slow_llm,
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                clear_audio,
+            )
+        )
+        await asyncio.gather(first, second, return_exceptions=True)
+
+    with caplog.at_level("INFO"):
+        asyncio.run(_run_both())
+
+    # First turn's question stays (it really was asked); its reply never
+    # arrives because cancellation happened before the LLM could finish.
+    # Second turn completes normally, uninterrupted.
+    assert history == [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "slow-reply"},
+    ]
+    assert call_order == ["clear_audio", "llm_cancelled"]
+    assert any(
+        "barge-in: cancelled in-flight reply" in r.message for r in caplog.records
+    )
+
+
+def test_cancelling_an_already_finished_reply_is_a_noop():
+    tts = FakeTTS()
+    played: list[np.ndarray] = []
+    history: list[dict[str, str]] = []
+    lock = asyncio.Lock()
+    active_reply = ActiveReply()
+    play = _recording_player(played)
+    clear_calls: list[str] = []
+    clear_audio = _recording_clear_audio(clear_calls)
+
+    async def _run_sequential():
+        first = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("first"),
+                FakeLLM(["first-reply"]),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                clear_audio,
+            )
+        )
+        await first
+        second = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("second"),
+                FakeLLM(["second-reply"]),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                clear_audio,
+            )
+        )
+        await second
+
+    asyncio.run(_run_sequential())
+
+    assert history == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first-reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second-reply"},
+    ]
+    assert clear_calls == []

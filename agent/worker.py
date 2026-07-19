@@ -1,5 +1,5 @@
 """Voice agent worker: Silero VAD, Smart Turn, gated STT, streaming LLM,
-and sentence-buffered TTS.
+sentence-buffered TTS, and barge-in.
 
 Joins a LiveKit room dispatched to us, subscribes to the first remote audio
 track, and runs every incoming frame through the ingress format contract
@@ -7,13 +7,17 @@ track, and runs every incoming frame through the ingress format contract
 both to decide when an utterance is ready to transcribe; a confirmed
 transcript goes to the LLM, whose streamed reply is flushed sentence-by-
 sentence to TTS and published back into the room as the agent's spoken
-reply.
+reply. If a new confirmed utterance arrives while a reply is still being
+generated or spoken, that reply is cancelled and its audio queue cleared
+-- see docs/superpowers/specs/2026-07-19-barge-in-design.md.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 import numpy as np
 from dotenv import load_dotenv
@@ -30,6 +34,15 @@ from agent.turn_gate import Continue, ForceFire, GateResult, TurnGate, create_tu
 from agent.vad import create_vad
 
 PlayAudio = Callable[[np.ndarray], Awaitable[None]]
+ClearAudio = Callable[[], None]
+
+
+@dataclass
+class ActiveReply:
+    """Tracks the currently in-flight _dispatch_gate_result task (if any)
+    so a new confirmed turn can cancel it -- see barge-in design spec."""
+
+    task: asyncio.Task | None = None
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -276,21 +289,41 @@ async def _dispatch_gate_result(
     tts_backend: TTSBackend,
     history: list[dict[str, str]],
     history_lock: asyncio.Lock,
+    active_reply: ActiveReply,
     play_audio: PlayAudio,
+    clear_audio: ClearAudio,
 ) -> None:
     """Handle a TurnGate decision: log-and-return on Continue, transcribe
     and log the transcript on Fire/ForceFire, then stream an LLM reply,
     flushing it sentence-by-sentence to TTS as it arrives.
 
-    history_lock serializes "append user turn -> stream reply -> append
-    assistant turn": TurnGate lets a new utterance start firing dispatch
-    tasks while a prior turn's LLM stream is still running (nothing stops
-    overlapping Fire/ForceFire events), and without a lock two concurrent
-    tasks could interleave appends to the shared history list.
+    Barge-in: if a reply is still in flight (LLM streaming, TTS synthesis,
+    or mid-playback) when a new confirmed Fire/ForceFire arrives, that
+    prior task is cancelled and the audio queue cleared before this turn
+    does anything else -- see
+    docs/superpowers/specs/2026-07-19-barge-in-design.md. The cancelled
+    task's user turn stays in history (it was really said); its assistant
+    reply never gets appended since cancellation happens before that
+    point, so the next request just sees two consecutive user turns,
+    which chat-tuned models tolerate.
+
+    history_lock is now a defensive invariant rather than the primary
+    serialization mechanism: cancelling the predecessor and awaiting its
+    exit guarantees the lock is free by the time this turn tries to
+    acquire it.
     """
     if isinstance(result, Continue):
         logger.info("turn incomplete, continuing to listen")
         return
+
+    current = asyncio.current_task()
+    if active_reply.task is not None and not active_reply.task.done():
+        active_reply.task.cancel()
+        clear_audio()
+        logger.info("barge-in: cancelled in-flight reply")
+        with contextlib.suppress(asyncio.CancelledError):
+            await active_reply.task
+    active_reply.task = current
 
     forced = isinstance(result, ForceFire)
     if forced:
@@ -302,8 +335,6 @@ async def _dispatch_gate_result(
         return
     logger.info("TRANSCRIPT (%s): %r", "forced" if forced else "confirmed", text)
 
-    if history_lock.locked():
-        logger.warning("overlapping turn: waiting for prior LLM reply to finish")
     async with history_lock:
         history.append({"role": "user", "content": text})
         sentence_buffer = SentenceBuffer()
