@@ -5,20 +5,19 @@ architecture spec; this README documents only what is built and verified.
 
 ## What works today
 
-An echo loop with Silero VAD and Smart Turn v3 both observing the
-normalised buffer:
+A full-local voice agent loop: mic in, Silero VAD + Smart Turn v3 gate the
+turn, `mlx-whisper` transcribes, Ollama replies, and Kokoro speaks the
+reply back — no echo, no cloud LLM/TTS.
 
 - Browser mic → LiveKit Cloud → `livekit-agents` worker (Python, M4 Pro)
 - Every incoming audio frame is normalised at ingress to **16 kHz mono
-  float32** (the format contract every downstream ML stage will consume)
-- The worker republishes the normalised audio back into the room (echo)
-- **Silero VAD** runs alongside on the same normalised buffer and logs
+  float32** (the format contract every downstream ML stage consumes)
+- **Silero VAD** runs on the normalised buffer and logs
   `SPEECH_START` / `SPEECH_END` events during utterances
 - **Smart Turn v3** (ONNX, CPU) runs on a background thread, re-scoring an
   8 s rolling window every 100ms. Its end-of-turn completion probability is
   logged alongside every `SPEECH_END` event
   (`smart_turn_prob=0.95` = confident the turn is complete)
-- Browser plays the echo through the same LiveKit connection
 
 Verified: unit tests against two recorded fixtures (a complete and an
 incomplete utterance) confirm the ONNX inference + feature extraction
@@ -56,8 +55,24 @@ with a genuine follow-up question, logged `overlapping turn: waiting
 for prior LLM reply to finish`, and both turns still completed and
 appended to history in the correct order.
 
-No TTS yet — the LLM's streamed reply is log-only for now (no
-client-visible voice response).
+- A **sentence buffer** sits between the LLM stream and TTS: it
+  accumulates streamed tokens and flushes a segment once it both hits a
+  sentence boundary (`[. ? ! ,]`) and reaches the 20-char ElevenLabs-
+  recommended minimum, so TTS always gets full-sentence context instead
+  of one token at a time.
+- **Kokoro TTS** (`prince-canuma/Kokoro-82M`, MLX-accelerated via
+  `mlx-audio`) synthesises each flushed segment and the worker publishes
+  the resulting audio back into the room as the agent's spoken reply.
+  Any text still buffered when the LLM stream ends is flushed and
+  spoken too. The outbound track now carries this reply instead of an
+  echo of the user's own voice — the earlier echo-loop scaffolding is
+  gone.
+
+Verified: unit tests confirm the sentence buffer's flush-on-boundary
+logic and that Kokoro produces non-empty float32 audio at its native
+24 kHz. Verified live: dispatching a real LiveKit room join showed the
+worker preloading all five backends (VAD, Smart Turn, STT, LLM, TTS) and
+publishing the `agent-reply` track without error.
 
 ## Layout
 
@@ -70,8 +85,10 @@ agent/
   turn_gate.py          # utterance accumulation + Smart Turn-gated firing decision
   stt.py                # STTBackend protocol + mlx-whisper implementation
   llm.py                # LLMBackend protocol + streaming Ollama implementation
+  sentence_buffer.py    # buffers LLM tokens, flushes full sentences to TTS
+  tts.py                # TTSBackend protocol + Kokoro (MLX) implementation
   whisper_features.py   # vendored numpy-only log-mel feature extraction
-  worker.py             # livekit-agents worker: echo, VAD, Smart Turn, gated STT + LLM
+  worker.py             # livekit-agents worker: VAD, Smart Turn, gated STT, streaming LLM, sentence-buffered TTS reply
 client/
   index.html          # LiveKit Web SDK demo client
 server/
@@ -85,7 +102,9 @@ tests/
   test_turn_gate_smart_turn.py     # gate decisions against real Smart Turn scores
   test_stt_backend.py              # mlx-whisper transcription against recorded fixtures
   test_llm_backend.py              # Ollama streaming chat against a real local server
-  test_worker_dispatch.py          # history + lock bookkeeping against fake backends
+  test_sentence_buffer.py          # flush-on-boundary + min-length logic
+  test_tts_backend.py              # Kokoro synthesis against real inference
+  test_worker_dispatch.py          # history/lock bookkeeping + TTS handoff against fake backends
   fixtures/smart_turn/             # complete.wav / incomplete.wav
 design.md             # architecture spec (source of truth)
 requirements.txt      # runtime deps (livekit-agents, fastapi, etc.)
@@ -152,7 +171,18 @@ The worker talks to Ollama over HTTP at `OLLAMA_HOST` (defaults to
 the worker still starts — the LLM call simply fails and is logged as an
 exception (`LLM streaming failed`) rather than crashing the pipeline.
 
-## Run the echo loop
+### Kokoro TTS weights
+
+No manual download step — `mlx-audio` resolves and caches
+`prince-canuma/Kokoro-82M` from the HF Hub itself on first use, and
+`misaki[en]` (the text-to-phoneme frontend Kokoro depends on) downloads
+a spaCy English model (`en_core_web_sm`) on its first import. Both are
+cached under `~/.cache`, not `models/`. The first synthesis after a
+fresh install will be slow while these download and MLX compiles the
+model graph; subsequent calls are fast (tens to low hundreds of ms per
+sentence-length segment).
+
+## Run the agent
 
 Two processes, one machine.
 
@@ -161,13 +191,15 @@ Terminal 1 — sidecar (serves the client + mints room tokens):
 uvicorn server.main:app --host 127.0.0.1 --port 8000
 ```
 
-Terminal 2 — worker (joins dispatched rooms, does the echo):
+Terminal 2 — worker (joins dispatched rooms, runs VAD → Smart Turn →
+STT → LLM → TTS):
 ```bash
 python -m agent.worker dev
 ```
 
-Then open **http://127.0.0.1:8000**, click **Connect**, allow mic, and speak.
-You should hear yourself echoed back with 200–400 ms of round-trip latency.
+Then open **http://127.0.0.1:8000**, click **Connect**, allow mic, and
+speak. The worker transcribes your turn, sends it to the LLM, and speaks
+the streamed reply back through Kokoro TTS.
 
 ## Run the tests
 
@@ -187,3 +219,6 @@ SMART_TURN_MODEL_PATH=models/smart-turn-v3/onnx/model.onnx python -m pytest test
 
 `test_llm_backend.py` skips unless Ollama is reachable at `OLLAMA_HOST`
 (see "Ollama LLM setup" above).
+
+`test_tts_backend.py` skips on non-Apple-Silicon machines and downloads
+the Kokoro-82M weights on first run (see "Kokoro TTS weights" above).
