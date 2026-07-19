@@ -17,7 +17,7 @@ Stretch target: **< 500ms TTFA** on cloud stack.
 **Local dev machine: Apple M4 Pro (unified memory, Metal GPU, Neural Engine)**
 
 This shapes every local stack decision:
-- Metal GPU via PyTorch MPS backend accelerates STT and TTS inference
+- Metal GPU via Apple's MLX framework accelerates STT and TTS inference
 - Unified memory means no CPU↔GPU data transfer overhead — models load fast
 - 24–48GB RAM allows running large models locally that would OOM on discrete GPUs
 - MLX (Apple's ML framework) is purpose-built for this architecture and outperforms
@@ -219,7 +219,7 @@ All inference on-device via Apple MLX / Metal. No API costs, best privacy story.
 | End-of-turn | Smart Turn v3 ONNX | CPU |
 | STT | `mlx-whisper large-v3` | Metal (MLX) |
 | LLM | Ollama + Llama 3.2 8B | Metal |
-| TTS | Kokoro | MPS |
+| TTS | Kokoro | Metal (MLX) |
 
 **Expected TTFA: 500ms–1.2s**
 
@@ -233,7 +233,7 @@ Best TTFA while keeping audio data on-device.
 | End-of-turn | Smart Turn v3 ONNX | CPU |
 | STT | `mlx-whisper large-v3` | Metal (MLX) |
 | LLM | GPT-4o streaming | Cloud |
-| TTS | Kokoro | MPS |
+| TTS | Kokoro | Metal (MLX) |
 
 **Expected TTFA: 350–700ms**
 
