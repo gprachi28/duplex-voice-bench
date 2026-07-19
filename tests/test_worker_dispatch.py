@@ -1,8 +1,11 @@
 """Pure unit tests for _dispatch_gate_result's LLM + TTS + barge-in wiring
 -- fake STT/LLM/TTS backends, no real audio, no network. Exercises history
 bookkeeping, the sentence-buffer-gated TTS handoff, and barge-in: a new
-confirmed Fire/ForceFire cancels whatever reply is still in flight rather
-than waiting for it, per docs/superpowers/specs/2026-07-19-barge-in-design.md.
+confirmed Fire/ForceFire cooperatively interrupts whatever reply is still
+in flight rather than waiting for it, per
+docs/superpowers/specs/2026-07-19-barge-in-design.md's "Revision" section
+-- not asyncio.Task.cancel(), which corrupts LiveKit's AudioSource if it
+lands mid-capture_frame() (confirmed via live reproduction).
 """
 
 import asyncio
@@ -23,26 +26,15 @@ class FakeSTT:
 
 
 class FakeLLM:
-    def __init__(
-        self,
-        chunks: list[str],
-        delay_s: float = 0.0,
-        cancel_log: list[str] | None = None,
-    ) -> None:
+    def __init__(self, chunks: list[str], delay_s: float = 0.0) -> None:
         self._chunks = chunks
         self._delay_s = delay_s
-        self._cancel_log = cancel_log
         self.calls: list[list[dict[str, str]]] = []
 
     async def stream_chat(self, messages):
         self.calls.append([dict(m) for m in messages])
         if self._delay_s:
-            try:
-                await asyncio.sleep(self._delay_s)
-            except asyncio.CancelledError:
-                if self._cancel_log is not None:
-                    self._cancel_log.append("llm_cancelled")
-                raise
+            await asyncio.sleep(self._delay_s)
         for chunk in self._chunks:
             yield chunk
 
@@ -205,23 +197,22 @@ def test_fire_keeps_history_when_tts_synthesis_fails(caplog):
     assert played == []
 
 
-def test_barge_in_cancels_in_flight_reply_and_completes_new_turn(caplog):
-    call_order: list[str] = []
-    slow_llm = FakeLLM(["slow-reply"], delay_s=0.2, cancel_log=call_order)
+def test_barge_in_interrupts_in_flight_reply_and_completes_new_turn(caplog):
     tts = FakeTTS()
     played: list[np.ndarray] = []
     history: list[dict[str, str]] = []
     lock = asyncio.Lock()
     active_reply = ActiveReply()
     play = _recording_player(played)
-    clear_audio = _recording_clear_audio(call_order)
+    clear_calls: list[str] = []
+    clear_audio = _recording_clear_audio(clear_calls)
 
     async def _run_both():
         first = asyncio.create_task(
             _dispatch_gate_result(
                 Fire(np.zeros(1, dtype=np.float32)),
                 FakeSTT("first"),
-                slow_llm,
+                FakeLLM(["first-reply"], delay_s=0.2),
                 tts,
                 history,
                 lock,
@@ -235,7 +226,7 @@ def test_barge_in_cancels_in_flight_reply_and_completes_new_turn(caplog):
             _dispatch_gate_result(
                 Fire(np.zeros(1, dtype=np.float32)),
                 FakeSTT("second"),
-                slow_llm,
+                FakeLLM(["second-reply"]),
                 tts,
                 history,
                 lock,
@@ -244,26 +235,28 @@ def test_barge_in_cancels_in_flight_reply_and_completes_new_turn(caplog):
                 clear_audio,
             )
         )
-        await asyncio.gather(first, second, return_exceptions=True)
+        await asyncio.gather(first, second)
 
     with caplog.at_level("INFO"):
         asyncio.run(_run_both())
 
     # First turn's question stays (it really was asked); its reply never
-    # arrives because cancellation happened before the LLM could finish.
-    # Second turn completes normally, uninterrupted.
+    # arrives because the interruption flag was checked before it could
+    # synthesize/play/append anything. Second turn completes normally.
     assert history == [
         {"role": "user", "content": "first"},
         {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "slow-reply"},
+        {"role": "assistant", "content": "second-reply"},
     ]
-    assert call_order == ["clear_audio", "llm_cancelled"]
+    assert tts.synthesized == ["second-reply"]
+    assert clear_calls == ["clear_audio"]
     assert any(
-        "barge-in: cancelled in-flight reply" in r.message for r in caplog.records
+        "barge-in: interrupting in-flight reply" in r.message
+        for r in caplog.records
     )
 
 
-def test_cancelling_an_already_finished_reply_is_a_noop():
+def test_barging_in_on_an_already_finished_reply_is_a_noop():
     tts = FakeTTS()
     played: list[np.ndarray] = []
     history: list[dict[str, str]] = []

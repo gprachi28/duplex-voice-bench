@@ -8,12 +8,15 @@ both to decide when an utterance is ready to transcribe; a confirmed
 transcript goes to the LLM, whose streamed reply is flushed sentence-by-
 sentence to TTS and published back into the room as the agent's spoken
 reply. If a new confirmed utterance arrives while a reply is still being
-generated or spoken, that reply is cancelled and its audio queue cleared
--- see docs/superpowers/specs/2026-07-19-barge-in-design.md.
+generated or spoken, that reply is cooperatively interrupted and its
+audio queue cleared -- see
+docs/superpowers/specs/2026-07-19-barge-in-design.md (including its
+"Revision" section: interruption is a checked flag, not
+asyncio.Task.cancel(), which corrupts LiveKit's AudioSource if it lands
+mid-capture_frame()).
 """
 
 import asyncio
-import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -40,9 +43,14 @@ ClearAudio = Callable[[], None]
 @dataclass
 class ActiveReply:
     """Tracks the currently in-flight _dispatch_gate_result task (if any)
-    so a new confirmed turn can cancel it -- see barge-in design spec."""
+    and whether it's been asked to stop -- see barge-in design spec.
+    Interruption is cooperative: the task checks `interrupted` at natural
+    checkpoints rather than being cancelled, since asyncio.Task.cancel()
+    corrupts LiveKit's AudioSource if it lands mid-capture_frame()."""
 
     task: asyncio.Task | None = None
+    interrupted: bool = False
+
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -78,6 +86,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 samples_per_channel=len(pcm),
             )
         )
+
+    def clear_audio() -> None:
+        source.clear_queue()
 
     # Set up track queue *before* connect so no early track is missed.
     remote_audio: asyncio.Queue[tuple[rtc.Track, rtc.RemoteParticipant]] = (
@@ -116,9 +127,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     stt_backend = create_stt_backend()
     llm_backend = create_llm_backend()
     # Session-scoped, NOT a singleton like the backends above -- a fresh
-    # list/lock per room job, or history would leak across rooms.
+    # list/lock/reply-tracker per room job, or state would leak across rooms.
     history: list[dict[str, str]] = []
     history_lock = asyncio.Lock()
+    active_reply = ActiveReply()
 
     vad_stream = create_vad().stream()
     vad_task = asyncio.create_task(
@@ -131,7 +143,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             tts_backend,
             history,
             history_lock,
+            active_reply,
             play_audio,
+            clear_audio,
         )
     )
     ingest_task = asyncio.create_task(
@@ -145,7 +159,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             tts_backend,
             history,
             history_lock,
+            active_reply,
             play_audio,
+            clear_audio,
         )
     )
     left_task = asyncio.create_task(user_left.wait())
@@ -173,7 +189,9 @@ async def _ingest(
     tts_backend: TTSBackend,
     history: list[dict[str, str]],
     history_lock: asyncio.Lock,
+    active_reply: ActiveReply,
     play_audio: PlayAudio,
+    clear_audio: ClearAudio,
 ) -> None:
     """Read frames, normalise, and mirror into the VAD stream, the Smart
     Turn ring buffer, and the turn gate's utterance buffer."""
@@ -198,7 +216,9 @@ async def _ingest(
                     tts_backend,
                     history,
                     history_lock,
+                    active_reply,
                     play_audio,
+                    clear_audio,
                 )
             )
 
@@ -229,7 +249,9 @@ async def _consume_vad_events(
     tts_backend: TTSBackend,
     history: list[dict[str, str]],
     history_lock: asyncio.Lock,
+    active_reply: ActiveReply,
     play_audio: PlayAudio,
+    clear_audio: ClearAudio,
 ) -> None:
     """Log Silero VAD speech-boundary events, consulting the Smart Turn
     completion probability at END_OF_SPEECH to decide — via TurnGate —
@@ -257,7 +279,9 @@ async def _consume_vad_events(
                     tts_backend,
                     history,
                     history_lock,
+                    active_reply,
                     play_audio,
+                    clear_audio,
                 )
             )
         elif event.type == VADEventType.INFERENCE_DONE and not first_inference_logged:
@@ -282,6 +306,15 @@ async def _synthesize_and_play(
     await play_audio(audio)
 
 
+def _check_interrupted(active_reply: ActiveReply) -> bool:
+    """Checked at each natural pause point in _dispatch_gate_result's LLM
+    loop; logs once and reports whether this reply should stop now."""
+    if active_reply.interrupted:
+        logger.info("barge-in: reply interrupted mid-stream")
+        return True
+    return False
+
+
 async def _dispatch_gate_result(
     result: GateResult,
     stt_backend: STTBackend,
@@ -299,17 +332,20 @@ async def _dispatch_gate_result(
 
     Barge-in: if a reply is still in flight (LLM streaming, TTS synthesis,
     or mid-playback) when a new confirmed Fire/ForceFire arrives, that
-    prior task is cancelled and the audio queue cleared before this turn
-    does anything else -- see
-    docs/superpowers/specs/2026-07-19-barge-in-design.md. The cancelled
-    task's user turn stays in history (it was really said); its assistant
-    reply never gets appended since cancellation happens before that
-    point, so the next request just sees two consecutive user turns,
-    which chat-tuned models tolerate.
+    prior task is cooperatively interrupted -- not cancelled -- and the
+    audio queue cleared before this turn does anything else -- see
+    docs/superpowers/specs/2026-07-19-barge-in-design.md's "Revision"
+    section: asyncio.Task.cancel() corrupts LiveKit's AudioSource if it
+    lands mid-capture_frame() (confirmed via live reproduction), so
+    interruption is a checked flag instead. The interrupted task's user
+    turn stays in history (it was really said); its assistant reply never
+    gets appended since it returns as soon as it notices the flag, so the
+    next request just sees two consecutive user turns, which chat-tuned
+    models tolerate.
 
     history_lock is now a defensive invariant rather than the primary
-    serialization mechanism: cancelling the predecessor and awaiting its
-    exit guarantees the lock is free by the time this turn tries to
+    serialization mechanism: interrupting the predecessor and awaiting
+    its exit guarantees the lock is free by the time this turn tries to
     acquire it.
     """
     if isinstance(result, Continue):
@@ -318,11 +354,11 @@ async def _dispatch_gate_result(
 
     current = asyncio.current_task()
     if active_reply.task is not None and not active_reply.task.done():
-        active_reply.task.cancel()
+        active_reply.interrupted = True
         clear_audio()
-        logger.info("barge-in: cancelled in-flight reply")
-        with contextlib.suppress(asyncio.CancelledError):
-            await active_reply.task
+        logger.info("barge-in: interrupting in-flight reply")
+        await active_reply.task
+    active_reply.interrupted = False
     active_reply.task = current
 
     forced = isinstance(result, ForceFire)
@@ -343,12 +379,16 @@ async def _dispatch_gate_result(
             first_chunk = True
             chunks: list[str] = []
             async for chunk in llm_backend.stream_chat(history):
+                if _check_interrupted(active_reply):
+                    return
                 if first_chunk:
                     logger.info("LLM TTFT: %.3fs", time.monotonic() - start)
                     first_chunk = False
                 chunks.append(chunk)
                 for sentence in sentence_buffer.push(chunk):
                     await _synthesize_and_play(tts_backend, sentence, play_audio)
+                    if _check_interrupted(active_reply):
+                        return
         except Exception:
             # The user turn stays in history unanswered; the next turn's
             # request will just include two consecutive user messages,
@@ -358,6 +398,8 @@ async def _dispatch_gate_result(
         remainder = sentence_buffer.flush()
         if remainder:
             await _synthesize_and_play(tts_backend, remainder, play_audio)
+            if _check_interrupted(active_reply):
+                return
         response = "".join(chunks)
         history.append({"role": "assistant", "content": response})
         logger.info("LLM RESPONSE: %r", response)
