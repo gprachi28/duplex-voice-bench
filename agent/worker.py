@@ -374,6 +374,7 @@ def _append_heard(active_reply: ActiveReply, history: list[dict[str, str]]) -> N
     (e.g. interrupted before the first segment finished synthesizing)."""
     text = heard_text(active_reply.heard_timeline, active_reply.interrupted_at)
     if text:
+        logger.info("barge-in: heard before interrupt: %r", text)
         history.append({"role": "assistant", "content": text})
 
 
