@@ -534,3 +534,21 @@ def test_new_reply_resets_heard_timeline_and_cursor():
     # words (2 entries) instead of just its own (1).
     assert len(active_reply.heard_timeline) == 1
     assert active_reply.playback_cursor > 0.0
+
+
+def test_synthesize_and_play_inserts_space_between_segments():
+    # Kokoro's alignment gives each word its own trailing whitespace, but
+    # nothing separates one segment's last word from the next segment's
+    # first -- sentence-ending words like "Hello!" carry no trailing
+    # space, so two segments played back to back would otherwise read
+    # "Hello!Hello!" once joined.
+    tts = FakeTTS(words=[WordTiming("Hello!", start=0.0, end=0.3)])
+    active_reply = ActiveReply()
+    played: list[np.ndarray] = []
+    play = _recording_player(played)
+
+    asyncio.run(_synthesize_and_play(tts, "Hello!", play, active_reply))
+    asyncio.run(_synthesize_and_play(tts, "Hello!", play, active_reply))
+
+    joined = "".join(w.text for w in active_reply.heard_timeline)
+    assert joined == "Hello! Hello!"

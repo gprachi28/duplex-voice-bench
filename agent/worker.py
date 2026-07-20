@@ -352,8 +352,19 @@ async def _synthesize_and_play(
         text,
     )
     seg_start = max(time.monotonic(), active_reply.playback_cursor)
-    for word in result.words:
-        active_reply.heard_timeline.append(HeardWord(word.text, seg_start + word.end))
+    for i, word in enumerate(result.words):
+        word_text = word.text
+        if (
+            i == 0
+            and active_reply.heard_timeline
+            and not active_reply.heard_timeline[-1].text.endswith((" ", "\n"))
+        ):
+            # Kokoro gives each word its own trailing whitespace, but
+            # nothing separates one segment's last word from the next
+            # segment's first -- without this, back-to-back segments
+            # read "Hello!Hello!" once joined in heard_text().
+            word_text = " " + word_text
+        active_reply.heard_timeline.append(HeardWord(word_text, seg_start + word.end))
     active_reply.playback_cursor = seg_start + len(result.audio) / tts_backend.sample_rate
     await play_audio(result.audio)
 
