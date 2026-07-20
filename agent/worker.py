@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from dotenv import load_dotenv
@@ -41,15 +41,42 @@ ClearAudio = Callable[[], None]
 
 
 @dataclass
+class HeardWord:
+    """One word actually pushed to play_audio, with the absolute
+    time.monotonic() timestamp its playback is modeled to end at -- see
+    docs/superpowers/specs/2026-07-20-barge-in_heard_text.md."""
+
+    text: str
+    end: float
+
+
+def heard_text(timeline: list[HeardWord], interrupted_at: float | None) -> str:
+    """Words whose modeled playback ended before the barge-in cut time,
+    joined back into text. Returns "" if nothing was heard yet (empty
+    timeline, or the interrupt landed before any word finished, or no
+    interrupt happened at all)."""
+    if interrupted_at is None:
+        return ""
+    return "".join(w.text for w in timeline if w.end <= interrupted_at).strip()
+
+
+@dataclass
 class ActiveReply:
     """Tracks the currently in-flight _dispatch_gate_result task (if any)
     and whether it's been asked to stop -- see barge-in design spec.
     Interruption is cooperative: the task checks `interrupted` at natural
     checkpoints rather than being cancelled, since asyncio.Task.cancel()
-    corrupts LiveKit's AudioSource if it lands mid-capture_frame()."""
+    corrupts LiveKit's AudioSource if it lands mid-capture_frame().
+
+    heard_timeline/playback_cursor/interrupted_at exist to reconstruct how
+    much of an interrupted reply the user actually heard -- see
+    docs/superpowers/specs/2026-07-20-barge-in_heard_text.md."""
 
     task: asyncio.Task | None = None
     interrupted: bool = False
+    heard_timeline: list[HeardWord] = field(default_factory=list)
+    playback_cursor: float = 0.0
+    interrupted_at: float | None = None
 
 
 load_dotenv()
@@ -304,18 +331,31 @@ async def _synthesize_and_play(
     already synthesizing. Re-checked here, right before playback, so that
     a now-stale segment is discarded instead of played -- checking only
     before/after the whole synthesize+play unit (as callers also do) still
-    lets one full segment play after every barge-in."""
+    lets one full segment play after every barge-in.
+
+    Records each word's modeled absolute end-time into
+    active_reply.heard_timeline and advances playback_cursor -- see
+    docs/superpowers/specs/2026-07-20-barge-in_heard_text.md. Segments
+    queue behind each other (play_audio doesn't block for real-time
+    playback), so a segment's start is modeled as max(now, cursor), not
+    `now` directly."""
     try:
-        audio = await asyncio.to_thread(tts_backend.synthesize, text)
+        result = await asyncio.to_thread(tts_backend.synthesize, text)
     except Exception:
         logger.exception("TTS synthesis failed for segment: %r", text)
         return
     if active_reply.interrupted:
         return
     logger.info(
-        "TTS segment (%.2fs audio): %r", len(audio) / tts_backend.sample_rate, text
+        "TTS segment (%.2fs audio): %r",
+        len(result.audio) / tts_backend.sample_rate,
+        text,
     )
-    await play_audio(audio)
+    seg_start = max(time.monotonic(), active_reply.playback_cursor)
+    for word in result.words:
+        active_reply.heard_timeline.append(HeardWord(word.text, seg_start + word.end))
+    active_reply.playback_cursor = seg_start + len(result.audio) / tts_backend.sample_rate
+    await play_audio(result.audio)
 
 
 def _check_interrupted(active_reply: ActiveReply) -> bool:
@@ -325,6 +365,16 @@ def _check_interrupted(active_reply: ActiveReply) -> bool:
         logger.info("barge-in: reply interrupted mid-stream")
         return True
     return False
+
+
+def _append_heard(active_reply: ActiveReply, history: list[dict[str, str]]) -> None:
+    """Called wherever _dispatch_gate_result returns early on interrupt.
+    Appends only what the user actually heard (per heard_text), not the
+    full generated reply -- and appends nothing if nothing was heard yet
+    (e.g. interrupted before the first segment finished synthesizing)."""
+    text = heard_text(active_reply.heard_timeline, active_reply.interrupted_at)
+    if text:
+        history.append({"role": "assistant", "content": text})
 
 
 async def _dispatch_gate_result(
@@ -367,11 +417,15 @@ async def _dispatch_gate_result(
     current = asyncio.current_task()
     if active_reply.task is not None and not active_reply.task.done():
         active_reply.interrupted = True
+        active_reply.interrupted_at = time.monotonic()
         clear_audio()
         logger.info("barge-in: interrupting in-flight reply")
         await active_reply.task
     active_reply.interrupted = False
     active_reply.task = current
+    active_reply.heard_timeline = []
+    active_reply.playback_cursor = 0.0
+    active_reply.interrupted_at = None
 
     forced = isinstance(result, ForceFire)
     if forced:
@@ -392,6 +446,7 @@ async def _dispatch_gate_result(
             chunks: list[str] = []
             async for chunk in llm_backend.stream_chat(history):
                 if _check_interrupted(active_reply):
+                    _append_heard(active_reply, history)
                     return
                 if first_chunk:
                     logger.info("LLM TTFT: %.3fs", time.monotonic() - start)
@@ -402,6 +457,7 @@ async def _dispatch_gate_result(
                         tts_backend, sentence, play_audio, active_reply
                     )
                     if _check_interrupted(active_reply):
+                        _append_heard(active_reply, history)
                         return
         except Exception:
             # The user turn stays in history unanswered; the next turn's
@@ -415,6 +471,7 @@ async def _dispatch_gate_result(
                 tts_backend, remainder, play_audio, active_reply
             )
             if _check_interrupted(active_reply):
+                _append_heard(active_reply, history)
                 return
         response = "".join(chunks)
         history.append({"role": "assistant", "content": response})

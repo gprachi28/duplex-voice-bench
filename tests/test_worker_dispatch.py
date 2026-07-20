@@ -9,12 +9,20 @@ lands mid-capture_frame() (confirmed via live reproduction).
 """
 
 import asyncio
+import time
 
 import numpy as np
 import pytest
 
+from agent.tts import TTSResult, WordTiming
 from agent.turn_gate import Continue, Fire
-from agent.worker import ActiveReply, _dispatch_gate_result
+from agent.worker import (
+    ActiveReply,
+    HeardWord,
+    _dispatch_gate_result,
+    _synthesize_and_play,
+    heard_text,
+)
 
 
 class FakeSTT:
@@ -26,31 +34,42 @@ class FakeSTT:
 
 
 class FakeLLM:
-    def __init__(self, chunks: list[str], delay_s: float = 0.0) -> None:
+    def __init__(
+        self,
+        chunks: list[str],
+        delay_s: float = 0.0,
+        mid_delay_s: float = 0.0,
+        mid_delay_after: int = 0,
+    ) -> None:
         self._chunks = chunks
         self._delay_s = delay_s
+        self._mid_delay_s = mid_delay_s
+        self._mid_delay_after = mid_delay_after
         self.calls: list[list[dict[str, str]]] = []
 
     async def stream_chat(self, messages):
         self.calls.append([dict(m) for m in messages])
         if self._delay_s:
             await asyncio.sleep(self._delay_s)
-        for chunk in self._chunks:
+        for i, chunk in enumerate(self._chunks):
             yield chunk
+            if self._mid_delay_s and i == self._mid_delay_after:
+                await asyncio.sleep(self._mid_delay_s)
 
 
 class FakeTTS:
     sample_rate = 24_000
 
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, fail: bool = False, words: list[WordTiming] | None = None) -> None:
         self._fail = fail
+        self._words = words or []
         self.synthesized: list[str] = []
 
-    def synthesize(self, text: str) -> np.ndarray:
+    def synthesize(self, text: str) -> TTSResult:
         if self._fail:
             raise RuntimeError("synth failed")
         self.synthesized.append(text)
-        return np.ones(len(text), dtype=np.float32)
+        return TTSResult(np.ones(len(text), dtype=np.float32), self._words)
 
 
 def _recording_player(sink: list[np.ndarray]):
@@ -271,11 +290,11 @@ def test_barge_in_discards_audio_synthesized_after_interruption_flagged():
     class InterruptingTTS:
         sample_rate = 24_000
 
-        def synthesize(self, text: str) -> np.ndarray:
+        def synthesize(self, text: str) -> TTSResult:
             # Simulate a second turn's barge-in landing while this
             # (uncancellable) synthesis call is already in flight.
             active_reply.interrupted = True
-            return np.ones(len(text), dtype=np.float32)
+            return TTSResult(np.ones(len(text), dtype=np.float32), [])
 
     asyncio.run(
         _dispatch_gate_result(
@@ -343,3 +362,175 @@ def test_barging_in_on_an_already_finished_reply_is_a_noop():
         {"role": "assistant", "content": "second-reply"},
     ]
     assert clear_calls == []
+
+
+def test_heard_text_returns_words_up_to_interrupt():
+    timeline = [
+        HeardWord("Hello ", end=0.3),
+        HeardWord("there, ", end=0.6),
+        HeardWord("friend.", end=1.0),
+    ]
+    assert heard_text(timeline, interrupted_at=0.7) == "Hello there,"
+
+
+def test_heard_text_empty_timeline_returns_empty():
+    assert heard_text([], interrupted_at=5.0) == ""
+
+
+def test_heard_text_interrupt_before_first_word_returns_empty():
+    timeline = [HeardWord("Hello ", end=0.3)]
+    assert heard_text(timeline, interrupted_at=0.1) == ""
+
+
+def test_heard_text_interrupt_after_all_words_returns_full():
+    timeline = [HeardWord("Hello ", end=0.3), HeardWord("there.", end=0.6)]
+    assert heard_text(timeline, interrupted_at=10.0) == "Hello there."
+
+
+def test_heard_text_none_interrupt_returns_empty():
+    timeline = [HeardWord("Hello ", end=0.3)]
+    assert heard_text(timeline, interrupted_at=None) == ""
+
+
+def test_synthesize_and_play_populates_heard_timeline():
+    words = [
+        WordTiming("Hi ", start=0.0, end=0.3),
+        WordTiming("there.", start=0.3, end=0.6),
+    ]
+    tts = FakeTTS(words=words)
+    active_reply = ActiveReply()
+    played: list[np.ndarray] = []
+    play = _recording_player(played)
+
+    before = time.monotonic()
+    asyncio.run(_synthesize_and_play(tts, "Hi there.", play, active_reply))
+    after = time.monotonic()
+
+    assert [w.text for w in active_reply.heard_timeline] == ["Hi ", "there."]
+    first_end, second_end = (w.end for w in active_reply.heard_timeline)
+    assert before + 0.3 <= first_end <= after + 0.3
+    assert before + 0.6 <= second_end <= after + 0.6
+    assert first_end < second_end
+
+    expected_audio_duration = len("Hi there.") / tts.sample_rate
+    assert (
+        before + expected_audio_duration
+        <= active_reply.playback_cursor
+        <= after + expected_audio_duration
+    )
+
+
+def test_barge_in_mid_playback_appends_truncated_prefix():
+    # sentence_buffer needs >= 20 chars before it will flush, so the first
+    # chunk alone must clear that bar to get synthesized+played before the
+    # interrupt lands.
+    words = [
+        WordTiming("This ", start=0.0, end=0.02),
+        WordTiming("is ", start=0.02, end=0.04),
+        WordTiming("a ", start=0.04, end=0.06),
+        WordTiming("longer ", start=0.06, end=0.08),
+        WordTiming("greeting.", start=0.08, end=0.10),
+    ]
+    tts = FakeTTS(words=words)
+    played: list[np.ndarray] = []
+    history: list[dict[str, str]] = []
+    lock = asyncio.Lock()
+    active_reply = ActiveReply()
+    play = _recording_player(played)
+
+    full_reply = "This is a longer greeting. This is more."
+
+    async def _run_both():
+        first = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("first"),
+                FakeLLM(
+                    ["This is a longer greeting. ", "This is more."],
+                    mid_delay_s=0.2,
+                    mid_delay_after=0,
+                ),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                _noop_clear_audio,
+            )
+        )
+        # First's mid-delay (0.2s) is well past the point its first segment
+        # ("This is a longer greeting.") has synthesized and played, but
+        # well before its second chunk arrives -- this lands the barge-in
+        # mid-playback.
+        await asyncio.sleep(0.08)
+        second = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("second"),
+                FakeLLM(["second-reply"]),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                _noop_clear_audio,
+            )
+        )
+        await asyncio.gather(first, second)
+
+    asyncio.run(_run_both())
+
+    assert history[0] == {"role": "user", "content": "first"}
+    heard = history[1]
+    assert heard["role"] == "assistant"
+    assert heard["content"]
+    assert full_reply.startswith(heard["content"])
+    assert history[2] == {"role": "user", "content": "second"}
+    assert history[3] == {"role": "assistant", "content": "second-reply"}
+
+
+def test_new_reply_resets_heard_timeline_and_cursor():
+    tts = FakeTTS(words=[WordTiming("Hi ", start=0.0, end=0.02)])
+    played: list[np.ndarray] = []
+    history: list[dict[str, str]] = []
+    lock = asyncio.Lock()
+    active_reply = ActiveReply()
+    play = _recording_player(played)
+
+    async def _run_sequential():
+        first = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("first"),
+                FakeLLM(["Hi"]),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                _noop_clear_audio,
+            )
+        )
+        await first
+        second = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("second"),
+                FakeLLM(["Hi"]),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                _noop_clear_audio,
+            )
+        )
+        await second
+
+    asyncio.run(_run_sequential())
+
+    # _synthesize_and_play appends to heard_timeline; if the second
+    # dispatch didn't reset it at the start, it would hold both replies'
+    # words (2 entries) instead of just its own (1).
+    assert len(active_reply.heard_timeline) == 1
+    assert active_reply.playback_cursor > 0.0

@@ -10,6 +10,7 @@ A/B benchmarking is a stated project goal.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -19,10 +20,29 @@ KOKORO_REPO = "prince-canuma/Kokoro-82M"
 KOKORO_VOICE = "af_heart"
 
 
+@dataclass
+class WordTiming:
+    """One word's audio span within a synthesized segment. `text` includes
+    the token's trailing whitespace so joining WordTimings back together
+    reconstructs spacing. Backend-agnostic (no misaki/Kokoro types) so a
+    future ElevenLabs/Cartesia backend can supply the same shape -- see
+    docs/superpowers/specs/2026-07-20-barge-in_heard_text.md."""
+
+    text: str
+    start: float
+    end: float
+
+
+@dataclass
+class TTSResult:
+    audio: np.ndarray
+    words: list[WordTiming] = field(default_factory=list)
+
+
 class TTSBackend(Protocol):
     sample_rate: int
 
-    def synthesize(self, text: str) -> np.ndarray: ...
+    def synthesize(self, text: str) -> TTSResult: ...
 
 
 class KokoroBackend:
@@ -34,14 +54,35 @@ class KokoroBackend:
         self._voice = voice
         self.sample_rate = self._model.sample_rate
 
-    def synthesize(self, text: str) -> np.ndarray:
-        segments = [
-            np.array(result.audio, dtype=np.float32)
-            for result in self._model.generate(text, voice=self._voice)
-        ]
+    def synthesize(self, text: str) -> TTSResult:
+        # model.generate() wraps the pipeline but only unpacks
+        # (graphemes, phonemes, audio) from each Result, discarding
+        # .tokens (word-level alignment). Call the pipeline directly to
+        # keep it. Result.audio is (1, N) batch-first; [0] unwraps to the
+        # 1-D waveform model.generate() would otherwise have returned.
+        pipeline = self._model._get_pipeline("a")
+        segments: list[np.ndarray] = []
+        words: list[WordTiming] = []
+        offset_s = 0.0
+        for result in pipeline(text, voice=self._voice):
+            if result.audio is None:
+                continue
+            audio = np.array(result.audio[0], dtype=np.float32)
+            segments.append(audio)
+            for tok in result.tokens or []:
+                if tok.start_ts is None or tok.end_ts is None:
+                    continue
+                words.append(
+                    WordTiming(
+                        text=tok.text + tok.whitespace,
+                        start=offset_s + tok.start_ts,
+                        end=offset_s + tok.end_ts,
+                    )
+                )
+            offset_s += len(audio) / self.sample_rate
         if not segments:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(segments)
+            return TTSResult(np.zeros(0, dtype=np.float32), [])
+        return TTSResult(np.concatenate(segments), words)
 
 
 _backend_instance: KokoroBackend | None = None
