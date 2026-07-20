@@ -290,15 +290,27 @@ async def _consume_vad_events(
 
 
 async def _synthesize_and_play(
-    tts_backend: TTSBackend, text: str, play_audio: PlayAudio
+    tts_backend: TTSBackend,
+    text: str,
+    play_audio: PlayAudio,
+    active_reply: ActiveReply,
 ) -> None:
     """Synthesize one sentence-buffer-flushed segment and play it. A failed
     segment is logged and skipped rather than aborting the turn -- the LLM
-    reply still lands in history even if TTS drops a sentence."""
+    reply still lands in history even if TTS drops a sentence.
+
+    Synthesis runs in a thread executor and can't be cancelled mid-call, so
+    a barge-in can flip active_reply.interrupted while this segment is
+    already synthesizing. Re-checked here, right before playback, so that
+    a now-stale segment is discarded instead of played -- checking only
+    before/after the whole synthesize+play unit (as callers also do) still
+    lets one full segment play after every barge-in."""
     try:
         audio = await asyncio.to_thread(tts_backend.synthesize, text)
     except Exception:
         logger.exception("TTS synthesis failed for segment: %r", text)
+        return
+    if active_reply.interrupted:
         return
     logger.info(
         "TTS segment (%.2fs audio): %r", len(audio) / tts_backend.sample_rate, text
@@ -386,7 +398,9 @@ async def _dispatch_gate_result(
                     first_chunk = False
                 chunks.append(chunk)
                 for sentence in sentence_buffer.push(chunk):
-                    await _synthesize_and_play(tts_backend, sentence, play_audio)
+                    await _synthesize_and_play(
+                        tts_backend, sentence, play_audio, active_reply
+                    )
                     if _check_interrupted(active_reply):
                         return
         except Exception:
@@ -397,7 +411,9 @@ async def _dispatch_gate_result(
             return
         remainder = sentence_buffer.flush()
         if remainder:
-            await _synthesize_and_play(tts_backend, remainder, play_audio)
+            await _synthesize_and_play(
+                tts_backend, remainder, play_audio, active_reply
+            )
             if _check_interrupted(active_reply):
                 return
         response = "".join(chunks)

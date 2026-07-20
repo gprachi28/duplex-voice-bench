@@ -256,6 +256,44 @@ def test_barge_in_interrupts_in_flight_reply_and_completes_new_turn(caplog):
     )
 
 
+def test_barge_in_discards_audio_synthesized_after_interruption_flagged():
+    """TTS synthesis runs in a thread executor and can't be cancelled
+    mid-call. If active_reply.interrupted flips true while a segment is
+    already synthesizing, the finished audio must be discarded -- not
+    played -- rather than checking the flag only before/after the whole
+    synthesize+play unit (which lets one full segment play after every
+    barge-in, audible as the agent talking over the user)."""
+    active_reply = ActiveReply()
+    played: list[np.ndarray] = []
+    play = _recording_player(played)
+    history: list[dict[str, str]] = []
+
+    class InterruptingTTS:
+        sample_rate = 24_000
+
+        def synthesize(self, text: str) -> np.ndarray:
+            # Simulate a second turn's barge-in landing while this
+            # (uncancellable) synthesis call is already in flight.
+            active_reply.interrupted = True
+            return np.ones(len(text), dtype=np.float32)
+
+    asyncio.run(
+        _dispatch_gate_result(
+            Fire(np.zeros(1, dtype=np.float32)),
+            FakeSTT("hi there"),
+            FakeLLM(["Hello there, this is a longer reply."]),
+            InterruptingTTS(),
+            history,
+            asyncio.Lock(),
+            active_reply,
+            play,
+            _noop_clear_audio,
+        )
+    )
+    assert played == []
+    assert history == [{"role": "user", "content": "hi there"}]
+
+
 def test_barging_in_on_an_already_finished_reply_is_a_noop():
     tts = FakeTTS()
     played: list[np.ndarray] = []
