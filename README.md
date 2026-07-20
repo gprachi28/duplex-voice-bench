@@ -74,6 +74,30 @@ logic and that Kokoro produces non-empty float32 audio at its native
 worker preloading all five backends (VAD, Smart Turn, STT, LLM, TTS) and
 publishing the `agent-reply` track without error.
 
+- **Barge-in**: if a new confirmed utterance arrives while a reply is
+  still being generated or spoken, that reply is cooperatively
+  interrupted — the in-flight LLM/TTS loop checks an `interrupted` flag
+  at natural pause points rather than being cancelled outright (an
+  earlier `asyncio.Task.cancel()`-based version corrupted LiveKit's
+  `AudioSource` when it landed mid-`capture_frame()`, reproduced live).
+  The audio queue is cleared, and a TTS segment still synthesizing when
+  the flag flips is discarded rather than played — synthesis runs in a
+  thread executor and can't be cancelled mid-call, so without this check
+  one full segment would otherwise always play after every barge-in.
+
+Verified live: repeated barge-in during an active reply correctly cut
+off the agent's speech with no `RtcError` and no dropped session.
+
+- Conversation history preserves a **truncated prefix of an interrupted
+  reply** — not the full generated text, and not nothing — using
+  Kokoro's own word-level alignment (start/end timestamps per word,
+  already computed during synthesis but previously discarded) correlated
+  against the wall-clock moment the barge-in landed.
+
+Verified live: a reply that had already played three TTS segments before
+being interrupted produced a history entry that stopped partway through
+the third segment's text instead of the full sentence or an empty turn.
+
 ## Layout
 
 ```
@@ -86,9 +110,9 @@ agent/
   stt.py                # STTBackend protocol + mlx-whisper implementation
   llm.py                # LLMBackend protocol + streaming Ollama implementation
   sentence_buffer.py    # buffers LLM tokens, flushes full sentences to TTS
-  tts.py                # TTSBackend protocol + Kokoro (MLX) implementation
+  tts.py                # TTSBackend protocol + Kokoro (MLX), incl. word-level alignment
   whisper_features.py   # vendored numpy-only log-mel feature extraction
-  worker.py             # livekit-agents worker: VAD, Smart Turn, gated STT, streaming LLM, sentence-buffered TTS reply
+  worker.py             # livekit-agents worker: VAD, Smart Turn, gated STT, streaming LLM, sentence-buffered TTS reply, barge-in
 client/
   index.html          # LiveKit Web SDK demo client
 server/
@@ -104,7 +128,7 @@ tests/
   test_llm_backend.py              # Ollama streaming chat against a real local server
   test_sentence_buffer.py          # flush-on-boundary + min-length logic
   test_tts_backend.py              # Kokoro synthesis against real inference
-  test_worker_dispatch.py          # history/lock bookkeeping + TTS handoff against fake backends
+  test_worker_dispatch.py          # history/lock bookkeeping, TTS handoff, and barge-in against fake backends
   fixtures/smart_turn/             # complete.wav / incomplete.wav
 design.md             # architecture spec (source of truth)
 requirements.txt      # runtime deps (livekit-agents, fastapi, etc.)
@@ -135,6 +159,13 @@ on python.org's macOS installer), run:
 ```bash
 "/Applications/Python 3.12/Install Certificates.command"
 ```
+
+`mlx-whisper` and Kokoro (via `mlx-audio`) both resolve their HF Hub repo
+IDs over the network on every load to check for a newer revision, even
+once the weights are already cached locally. Seen in practice: that
+network call can hang, and `livekit-agents`' job-init timeout then kills
+the worker's job process before it ever joins a room. `.env.example`
+sets `HF_HUB_OFFLINE=1` to skip that check and load straight from cache.
 
 ### Smart Turn v3 model weights
 
