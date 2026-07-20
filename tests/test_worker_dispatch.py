@@ -9,6 +9,7 @@ lands mid-capture_frame() (confirmed via live reproduction).
 """
 
 import asyncio
+import contextlib
 import time
 
 import numpy as np
@@ -19,7 +20,10 @@ from agent.turn_gate import Continue, Fire
 from agent.worker import (
     ActiveReply,
     HeardWord,
+    _arm_escalation,
+    _disarm_escalation,
     _dispatch_gate_result,
+    _escalate_barge_in,
     _synthesize_and_play,
     heard_text,
 )
@@ -552,3 +556,224 @@ def test_synthesize_and_play_inserts_space_between_segments():
 
     joined = "".join(w.text for w in active_reply.heard_timeline)
     assert joined == "Hello! Hello!"
+
+
+# --- Phase 1: barge-in decoupled from Smart Turn's completion probability.
+# Before this, only a confirmed Fire/ForceFire (smart_turn_prob >= 0.5)
+# could interrupt an in-flight reply -- a short interjection Smart Turn
+# scored low fell into TurnGate's Continue branch, which _dispatch_gate_
+# result returns from immediately without ever touching active_reply.
+# Confirmed live: a real SPEECH_END with smart_turn_prob=0.02 landed while
+# a reply was actively playing and did not interrupt it. _arm_escalation/
+# _escalate_barge_in add a wall-clock timer, started at VAD SPEECH_START
+# independent of waiting for Smart Turn, that commits to interrupting the
+# reply if speech is sustained past the timer -- reusing the exact
+# interrupted/clear_audio/heard_text machinery already verified above.
+
+
+async def _pending_task() -> asyncio.Task:
+    return asyncio.create_task(asyncio.sleep(10))
+
+
+async def _cancel(task: asyncio.Task) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def test_escalate_barge_in_interrupts_active_reply():
+    active_reply = ActiveReply()
+    clear_calls: list[str] = []
+    clear_audio = _recording_clear_audio(clear_calls)
+
+    async def _run():
+        active_reply.task = await _pending_task()
+        active_reply.speech_started_at = 123.0
+        _escalate_barge_in(active_reply, clear_audio)
+        await _cancel(active_reply.task)
+
+    asyncio.run(_run())
+
+    assert active_reply.interrupted is True
+    assert active_reply.interrupted_at == 123.0
+    assert clear_calls == ["clear_audio"]
+    assert active_reply.escalation_handle is None
+
+
+def test_escalate_barge_in_noop_when_no_active_reply():
+    active_reply = ActiveReply()
+    clear_calls: list[str] = []
+
+    _escalate_barge_in(active_reply, _recording_clear_audio(clear_calls))
+
+    assert active_reply.interrupted is False
+    assert clear_calls == []
+
+
+def test_escalate_barge_in_noop_when_task_already_done():
+    active_reply = ActiveReply()
+    clear_calls: list[str] = []
+
+    async def _run():
+        active_reply.task = asyncio.create_task(asyncio.sleep(0))
+        await active_reply.task
+
+    asyncio.run(_run())
+    _escalate_barge_in(active_reply, _recording_clear_audio(clear_calls))
+
+    assert active_reply.interrupted is False
+    assert clear_calls == []
+
+
+def test_arm_escalation_starts_timer_when_reply_active():
+    active_reply = ActiveReply()
+
+    async def _run():
+        active_reply.task = await _pending_task()
+        _arm_escalation(active_reply, _noop_clear_audio, delay_s=10.0)
+        assert active_reply.escalation_handle is not None
+        assert active_reply.speech_started_at is not None
+        active_reply.escalation_handle.cancel()
+        await _cancel(active_reply.task)
+
+    asyncio.run(_run())
+
+
+def test_arm_escalation_noop_when_no_reply_active():
+    active_reply = ActiveReply()
+
+    async def _run():
+        _arm_escalation(active_reply, _noop_clear_audio, delay_s=10.0)
+
+    asyncio.run(_run())
+
+    assert active_reply.escalation_handle is None
+    assert active_reply.speech_started_at is None
+
+
+def test_arm_escalation_noop_when_already_interrupted():
+    active_reply = ActiveReply()
+
+    async def _run():
+        active_reply.task = await _pending_task()
+        active_reply.interrupted = True
+        _arm_escalation(active_reply, _noop_clear_audio, delay_s=10.0)
+        await _cancel(active_reply.task)
+
+    asyncio.run(_run())
+
+    assert active_reply.escalation_handle is None
+
+
+def test_disarm_escalation_cancels_pending_timer():
+    active_reply = ActiveReply()
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        active_reply.escalation_handle = loop.call_later(10.0, lambda: None)
+        _disarm_escalation(active_reply)
+
+    asyncio.run(_run())
+
+    assert active_reply.escalation_handle is None
+
+
+def test_disarm_escalation_noop_when_nothing_armed():
+    active_reply = ActiveReply()
+    _disarm_escalation(active_reply)
+    assert active_reply.escalation_handle is None
+
+
+def test_sustained_speech_escalates_after_delay():
+    active_reply = ActiveReply()
+    clear_calls: list[str] = []
+    clear_audio = _recording_clear_audio(clear_calls)
+
+    async def _run():
+        active_reply.task = await _pending_task()
+        _arm_escalation(active_reply, clear_audio, delay_s=0.02)
+        await asyncio.sleep(0.06)
+        await _cancel(active_reply.task)
+
+    asyncio.run(_run())
+
+    assert active_reply.interrupted is True
+    assert clear_calls == ["clear_audio"]
+
+
+def test_early_disarm_prevents_escalation():
+    active_reply = ActiveReply()
+    clear_calls: list[str] = []
+    clear_audio = _recording_clear_audio(clear_calls)
+
+    async def _run():
+        active_reply.task = await _pending_task()
+        _arm_escalation(active_reply, clear_audio, delay_s=0.02)
+        await asyncio.sleep(0.005)
+        _disarm_escalation(active_reply)
+        await asyncio.sleep(0.05)  # well past the original delay
+        await _cancel(active_reply.task)
+
+    asyncio.run(_run())
+
+    assert active_reply.interrupted is False
+    assert clear_calls == []
+
+
+def test_barge_in_does_not_overwrite_interrupted_at_set_by_escalation():
+    """If escalation already interrupted+stamped active_reply before a
+    confirmed Fire's own dispatch runs its barge-in block, the earlier
+    (more accurate -- the moment speech actually started) timestamp must
+    survive. Otherwise heard_text would credit the user with hearing
+    words spoken after they'd already started talking."""
+    tts = FakeTTS()
+    history: list[dict[str, str]] = []
+    lock = asyncio.Lock()
+    active_reply = ActiveReply()
+    played: list[np.ndarray] = []
+    play = _recording_player(played)
+    clear_calls: list[str] = []
+    clear_audio = _recording_clear_audio(clear_calls)
+
+    async def _run():
+        first = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("first"),
+                FakeLLM(["first-reply"], delay_s=0.2),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                clear_audio,
+            )
+        )
+        await asyncio.sleep(0.02)
+        # Simulate escalation firing before the second turn's own dispatch
+        # gets a chance to run its barge-in block.
+        active_reply.interrupted = True
+        active_reply.interrupted_at = 12345.0
+        clear_audio()
+
+        second = asyncio.create_task(
+            _dispatch_gate_result(
+                Fire(np.zeros(1, dtype=np.float32)),
+                FakeSTT("second"),
+                FakeLLM(["second-reply"]),
+                tts,
+                history,
+                lock,
+                active_reply,
+                play,
+                clear_audio,
+            )
+        )
+        await asyncio.gather(first, second)
+
+    asyncio.run(_run())
+
+    # Only the simulated escalation should have cleared audio -- the
+    # second dispatch's own barge-in block must not re-clear or re-stamp
+    # interrupted_at once it sees active_reply is already interrupted.
+    assert clear_calls == ["clear_audio"]

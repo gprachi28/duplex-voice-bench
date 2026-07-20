@@ -70,13 +70,19 @@ class ActiveReply:
 
     heard_timeline/playback_cursor/interrupted_at exist to reconstruct how
     much of an interrupted reply the user actually heard -- see
-    docs/superpowers/specs/2026-07-20-barge-in_heard_text.md."""
+    docs/superpowers/specs/2026-07-20-barge-in_heard_text.md.
+
+    speech_started_at/escalation_handle exist so a barge-in doesn't have
+    to wait for Smart Turn to confirm the interrupting utterance is a
+    complete turn -- see _arm_escalation/_escalate_barge_in."""
 
     task: asyncio.Task | None = None
     interrupted: bool = False
     heard_timeline: list[HeardWord] = field(default_factory=list)
     playback_cursor: float = 0.0
     interrupted_at: float | None = None
+    speech_started_at: float | None = None
+    escalation_handle: asyncio.TimerHandle | None = None
 
 
 load_dotenv()
@@ -283,14 +289,22 @@ async def _consume_vad_events(
     """Log Silero VAD speech-boundary events, consulting the Smart Turn
     completion probability at END_OF_SPEECH to decide — via TurnGate —
     whether the turn is actually over. Also log the first VAD inference so
-    we can confirm the task is alive and Silero is producing outputs."""
+    we can confirm the task is alive and Silero is producing outputs.
+
+    SPEECH_START additionally arms a barge-in escalation timer (see
+    _arm_escalation) so an interrupting utterance doesn't have to wait for
+    Smart Turn to confirm it's a complete turn before it can interrupt an
+    in-flight reply; SPEECH_END disarms it since Smart Turn's own
+    Fire/Continue evaluation below can now run normally."""
     logger.info("VAD event task started")
     first_inference_logged = False
     async for event in vad_stream:
         if event.type == VADEventType.START_OF_SPEECH:
             logger.info("SPEECH_START (prob=%.2f)", event.probability)
             turn_gate.begin()
+            _arm_escalation(active_reply, clear_audio)
         elif event.type == VADEventType.END_OF_SPEECH:
+            _disarm_escalation(active_reply)
             prob = turn_observer.latest_probability
             logger.info(
                 "SPEECH_END (duration=%.2fs) smart_turn_prob=%.2f",
@@ -389,6 +403,65 @@ def _append_heard(active_reply: ActiveReply, history: list[dict[str, str]]) -> N
         history.append({"role": "assistant", "content": text})
 
 
+# Barge-in previously only fired on a confirmed Fire/ForceFire
+# (smart_turn_prob >= TurnGate's threshold) -- a short interjection Smart
+# Turn scored low fell into the Continue branch below, which returns
+# immediately without ever touching active_reply. Confirmed live: a real
+# SPEECH_END with smart_turn_prob=0.02 landed while a reply was actively
+# playing and didn't interrupt it. PROVISIONAL_MUTE_S decouples barge-in
+# responsiveness from Smart Turn's turn-completion question: a wall-clock
+# timer armed at VAD SPEECH_START commits to interrupting the reply if
+# speech is sustained past this long, independent of waiting for
+# SPEECH_END -- see docs/superpowers/specs/2026-07-20-barge-in_heard_text.md
+# for why interrupted_at is stamped at speech start, not escalation time.
+PROVISIONAL_MUTE_S = 0.25
+
+
+def _escalate_barge_in(active_reply: ActiveReply, clear_audio: ClearAudio) -> None:
+    """Timer callback: speech has been sustained past PROVISIONAL_MUTE_S,
+    so commit to interrupting the in-flight reply now rather than wait
+    for Smart Turn to eventually confirm the interrupting utterance is a
+    complete turn. A no-op if the reply already finished or was already
+    interrupted by the time the timer fires."""
+    if active_reply.task is None or active_reply.task.done():
+        return
+    if active_reply.interrupted:
+        return
+    active_reply.interrupted = True
+    active_reply.interrupted_at = active_reply.speech_started_at
+    clear_audio()
+    active_reply.escalation_handle = None
+    logger.info("barge-in: escalating after sustained speech")
+
+
+def _arm_escalation(
+    active_reply: ActiveReply, clear_audio: ClearAudio, delay_s: float = PROVISIONAL_MUTE_S
+) -> None:
+    """Called on VAD SPEECH_START. If a reply is actively in flight and
+    not already interrupted, starts the escalation timer instead of
+    waiting for Smart Turn to eventually decide the interrupting
+    utterance is a complete turn."""
+    if active_reply.task is None or active_reply.task.done():
+        return
+    if active_reply.interrupted:
+        return
+    active_reply.speech_started_at = time.monotonic()
+    loop = asyncio.get_running_loop()
+    active_reply.escalation_handle = loop.call_later(
+        delay_s, _escalate_barge_in, active_reply, clear_audio
+    )
+
+
+def _disarm_escalation(active_reply: ActiveReply) -> None:
+    """Called on VAD SPEECH_END. Cancels a pending escalation timer --
+    the speech that armed it turned out to be short enough that Smart
+    Turn's own Fire/Continue evaluation can handle it normally, or it's
+    already escalated and there's nothing to cancel."""
+    if active_reply.escalation_handle is not None:
+        active_reply.escalation_handle.cancel()
+        active_reply.escalation_handle = None
+
+
 async def _dispatch_gate_result(
     result: GateResult,
     stt_backend: STTBackend,
@@ -428,16 +501,24 @@ async def _dispatch_gate_result(
 
     current = asyncio.current_task()
     if active_reply.task is not None and not active_reply.task.done():
-        active_reply.interrupted = True
-        active_reply.interrupted_at = time.monotonic()
-        clear_audio()
-        logger.info("barge-in: interrupting in-flight reply")
+        if not active_reply.interrupted:
+            # Not already interrupted (e.g. by _escalate_barge_in, whose
+            # interrupted_at is stamped at the moment speech actually
+            # started -- more accurate than "now"). Don't clobber that
+            # with a later timestamp, which would credit heard_text with
+            # words spoken after the user had already started talking.
+            active_reply.interrupted = True
+            active_reply.interrupted_at = time.monotonic()
+            clear_audio()
+            logger.info("barge-in: interrupting in-flight reply")
         await active_reply.task
     active_reply.interrupted = False
     active_reply.task = current
     active_reply.heard_timeline = []
     active_reply.playback_cursor = 0.0
     active_reply.interrupted_at = None
+    active_reply.speech_started_at = None
+    _disarm_escalation(active_reply)
 
     forced = isinstance(result, ForceFire)
     if forced:
