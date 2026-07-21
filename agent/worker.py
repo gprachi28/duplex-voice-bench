@@ -227,6 +227,15 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     )
     left_task = asyncio.create_task(user_left.wait())
 
+    # Backends preload before entrypoint runs (see _prewarm), but VAD/
+    # ingest only start consuming audio frames from here -- anything
+    # spoken before this line won't be picked up. Logged as an explicit
+    # signal (not just implied by "listening to remote audio from ..."
+    # above, which fires once the track is subscribed but before these
+    # tasks exist) since a user speaking during that gap loses their
+    # first few words with no other indication why.
+    logger.info("ready — you can start talking now")
+
     try:
         _, pending = await asyncio.wait(
             [ingest_task, left_task], return_when=asyncio.FIRST_COMPLETED
