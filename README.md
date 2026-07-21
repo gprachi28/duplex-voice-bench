@@ -74,29 +74,51 @@ logic and that Kokoro produces non-empty float32 audio at its native
 worker preloading all five backends (VAD, Smart Turn, STT, LLM, TTS) and
 publishing the `agent-reply` track without error.
 
-- **Barge-in**: if a new confirmed utterance arrives while a reply is
-  still being generated or spoken, that reply is cooperatively
-  interrupted — the in-flight LLM/TTS loop checks an `interrupted` flag
-  at natural pause points rather than being cancelled outright (an
-  earlier `asyncio.Task.cancel()`-based version corrupted LiveKit's
-  `AudioSource` when it landed mid-`capture_frame()`, reproduced live).
-  The audio queue is cleared, and a TTS segment still synthesizing when
-  the flag flips is discarded rather than played — synthesis runs in a
-  thread executor and can't be cancelled mid-call, so without this check
-  one full segment would otherwise always play after every barge-in.
+- **Barge-in** reacts to Silero VAD `SPEECH_START` directly instead of
+  waiting for Smart Turn to confirm the interrupting utterance is a
+  complete turn. Smart Turn's completion probability is inherently
+  variable for short interjections ("stop", "wait"), so gating barge-in
+  on it meant real interruptions were silently absorbed by `TurnGate`'s
+  `Continue` branch while the agent kept talking (confirmed live: a real
+  `SPEECH_END` scored `smart_turn_prob=0.02` and didn't interrupt at
+  all). Now any detected speech immediately pauses playback — cooperative,
+  via a checked flag, not `asyncio.Task.cancel()` (an earlier cancel-based
+  version corrupted LiveKit's `AudioSource` when it landed mid-
+  `capture_frame()`, reproduced live). `PlaybackPump` submits TTS audio in
+  small real-time-paced frames instead of one call per segment, so
+  pausing mid-segment and resuming later is possible at all. If speech is
+  sustained past a 0.7s wall-clock timer (independent of waiting for
+  Smart Turn; must exceed Silero's own 0.3s trailing-silence window or
+  every interruption wins the race and the pause never gets a chance to
+  resolve as a false alarm), the pause escalates into a real interrupt.
+  If speech turns out to be brief instead, playback resumes from a
+  rewound word boundary — computed from Kokoro's own word-level alignment
+  (start/end timestamps per word, already produced during synthesis)
+  rather than a fixed time guess, so it never resumes mid-syllable. TTS
+  synthesis is deferred entirely while paused (checked both before
+  starting and again after, since synthesis itself can't be interrupted
+  mid-call), so a sentence generated during a pause that ends up
+  escalating never costs real Kokoro/MLX compute for audio nobody hears.
 
-Verified live: repeated barge-in during an active reply correctly cut
-off the agent's speech with no `RtcError` and no dropped session.
+Verified live: repeated barge-in — both brief (resume) and sustained
+(escalate) — during active replies muted the agent within one frame,
+with no `RtcError` and no dropped session. The `smart_turn_prob=0.02`
+scenario that previously went unnoticed now escalates correctly. A
+resumed reply continued from a rewound word boundary instead of
+mid-syllable; an escalated reply discarded only the small in-flight
+remainder rather than multiple full buffered-but-unplayed segments.
 
 - Conversation history preserves a **truncated prefix of an interrupted
   reply** — not the full generated text, and not nothing — using
-  Kokoro's own word-level alignment (start/end timestamps per word,
-  already computed during synthesis but previously discarded) correlated
-  against the wall-clock moment the barge-in landed.
+  Kokoro's own word-level alignment correlated against the wall-clock
+  moment the interrupt landed. On a pause that resumes instead of
+  escalating, the same alignment reconciles the truncation point back to
+  the rewind, so words about to be re-heard aren't double-counted.
 
-Verified live: a reply that had already played three TTS segments before
-being interrupted produced a history entry that stopped partway through
-the third segment's text instead of the full sentence or an empty turn.
+Verified live: an escalated reply's history entry stopped at the exact
+word whose modeled playback preceded the cut, matching the audio
+actually heard — not the full sentence, not an empty turn, and not
+words spoken after the interruption began.
 
 ## Layout
 
@@ -109,6 +131,7 @@ agent/
   turn_gate.py          # utterance accumulation + Smart Turn-gated firing decision
   stt.py                # STTBackend protocol + mlx-whisper implementation
   llm.py                # LLMBackend protocol + streaming Ollama implementation
+  playback.py           # PlaybackPump: real-time-paced audio submission, pause/resume-with-rewind
   sentence_buffer.py    # buffers LLM tokens, flushes full sentences to TTS
   tts.py                # TTSBackend protocol + Kokoro (MLX), incl. word-level alignment
   whisper_features.py   # vendored numpy-only log-mel feature extraction
@@ -128,6 +151,7 @@ tests/
   test_llm_backend.py              # Ollama streaming chat against a real local server
   test_sentence_buffer.py          # flush-on-boundary + min-length logic
   test_tts_backend.py              # Kokoro synthesis against real inference
+  test_playback.py                 # PlaybackPump framing, pause/resume rewind math, discard logging
   test_worker_dispatch.py          # history/lock bookkeeping, TTS handoff, and barge-in against fake backends
   fixtures/smart_turn/             # complete.wav / incomplete.wav
 design.md             # architecture spec (source of truth)
