@@ -25,6 +25,7 @@ from agent.worker import (
     _disarm_escalation,
     _dispatch_gate_result,
     _escalate_barge_in,
+    _shutdown_active_reply,
     _synthesize_and_play,
     heard_text,
 )
@@ -832,3 +833,55 @@ def test_pause_resume_keeps_heard_timeline_index_aligned_with_real_pump():
 
     # paused mid-W4 (index 4), rewind 2 -> keep_count 2 (W0, W1 kept).
     assert [w.text for w in active_reply.heard_timeline] == ["W0 ", "W1 "]
+
+
+# --- Session-end orphaned reply: confirmed live, a participant leaving
+# mid-reply didn't stop the in-flight LLM/TTS task -- it kept generating
+# and submitting TTS segments for several more seconds after "entrypoint
+# done" logged, audible to no one (the room had no listener left).
+
+
+def test_shutdown_active_reply_interrupts_in_flight_task():
+    active_reply = ActiveReply()
+    pump = FakePump()
+
+    async def _cooperative() -> None:
+        # Mimics _dispatch_gate_result's checked-flag cooperation: keeps
+        # "generating" until it notices interrupted, same as a real
+        # in-flight reply would at its next checkpoint.
+        while not active_reply.interrupted:
+            await asyncio.sleep(0.01)
+
+    async def _run():
+        active_reply.task = asyncio.create_task(_cooperative())
+        await asyncio.wait_for(_shutdown_active_reply(active_reply, pump), timeout=2.0)
+
+    asyncio.run(_run())
+
+    assert active_reply.interrupted is True
+    assert pump.calls == ["stop"]
+    assert active_reply.task.done()
+
+
+def test_shutdown_active_reply_noop_when_nothing_in_flight():
+    active_reply = ActiveReply()
+    pump = FakePump()
+
+    asyncio.run(_shutdown_active_reply(active_reply, pump))
+
+    assert active_reply.interrupted is False
+    assert pump.calls == []
+
+
+def test_shutdown_active_reply_noop_when_task_already_done():
+    active_reply = ActiveReply()
+    pump = FakePump()
+
+    async def _run():
+        active_reply.task = asyncio.create_task(asyncio.sleep(0))
+        await active_reply.task
+        await _shutdown_active_reply(active_reply, pump)
+
+    asyncio.run(_run())
+
+    assert pump.calls == []

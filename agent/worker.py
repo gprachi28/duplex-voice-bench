@@ -101,11 +101,37 @@ if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
     logger.addHandler(_fh)
 
 
+async def _shutdown_active_reply(active_reply: ActiveReply, pump: PlaybackPump) -> None:
+    """Called when a session is ending. An in-flight reply's LLM/TTS task
+    isn't cancelled by anything else -- confirmed live, it kept
+    generating and submitting TTS segments for several more seconds
+    after the participant left, audible to no one. Interrupt it the same
+    cooperative way as any other barge-in (asyncio.Task.cancel() corrupts
+    LiveKit's AudioSource if it lands mid-capture_frame() -- see barge-in
+    design spec) rather than cancelling it directly."""
+    if active_reply.task is None or active_reply.task.done():
+        return
+    active_reply.interrupted = True
+    pump.stop()
+    try:
+        await active_reply.task
+    except Exception:
+        logger.exception("in-flight reply task raised during shutdown")
+
+
 async def entrypoint(ctx: agents.JobContext) -> None:
     tts_backend = create_tts_backend()
 
-    # Outbound track carries the synthesised TTS reply, at Kokoro's native rate.
-    source = rtc.AudioSource(tts_backend.sample_rate, num_channels=1)
+    # Outbound track carries the synthesised TTS reply, at Kokoro's native
+    # rate. queue_size_ms is cut from the 1000ms default to 200ms: with the
+    # default, PlaybackPump's real-time-paced drain loop can race up to a
+    # full second ahead of actual playback before AudioSource.capture_frame
+    # starts blocking for backpressure (confirmed live: pause()'s reported
+    # position was word-count-plausible for "1s ahead" but not for real
+    # time elapsed, undermining both the pause/resume rewind point and
+    # _synthesize_and_play's heard_timeline wall-clock model, which both
+    # assume submission timing tracks real playback closely).
+    source = rtc.AudioSource(tts_backend.sample_rate, num_channels=1, queue_size_ms=200)
     out_track = rtc.LocalAudioTrack.create_audio_track("agent-reply", source)
 
     async def _capture_frame(audio: np.ndarray) -> None:
@@ -208,6 +234,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         for t in pending:
             t.cancel()
     finally:
+        await _shutdown_active_reply(active_reply, pump)
         turn_observer.stop()
         await vad_stream.aclose()
         vad_task.cancel()
