@@ -368,6 +368,13 @@ async def _consume_vad_events(
 SYNTH_PAUSE_POLL_S = 0.02
 
 
+async def _wait_while_paused(pump: PlaybackPump, active_reply: ActiveReply) -> None:
+    """Blocks until the pump stops being provisionally paused or the
+    reply is interrupted, whichever comes first."""
+    while pump.state == PlaybackState.PAUSED and not active_reply.interrupted:
+        await asyncio.sleep(SYNTH_PAUSE_POLL_S)
+
+
 async def _synthesize_and_play(
     tts_backend: TTSBackend,
     text: str,
@@ -399,9 +406,12 @@ async def _synthesize_and_play(
     confirmed live, without this a sentence generated during the pause
     window got fully synthesized (real Kokoro/MLX compute) and buffered
     with zero chance of being heard if the pause escalated into a real
-    interrupt seconds later, thrown away by pump.stop()."""
-    while pump.state == PlaybackState.PAUSED and not active_reply.interrupted:
-        await asyncio.sleep(SYNTH_PAUSE_POLL_S)
+    interrupt seconds later, thrown away by pump.stop(). Synthesis can't
+    be cancelled or checked mid-call, so a pause can also land *while*
+    it's already in flight (confirmed live: a segment logged 65ms after
+    "pausing playback provisionally") -- waited for again after
+    synthesis completes, before logging/submitting, to close that race."""
+    await _wait_while_paused(pump, active_reply)
     if active_reply.interrupted:
         return
     try:
@@ -409,6 +419,9 @@ async def _synthesize_and_play(
     except Exception:
         logger.exception("TTS synthesis failed for segment: %r", text)
         return
+    if active_reply.interrupted:
+        return
+    await _wait_while_paused(pump, active_reply)
     if active_reply.interrupted:
         return
     logger.info(

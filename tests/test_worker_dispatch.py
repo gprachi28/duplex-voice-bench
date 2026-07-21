@@ -457,6 +457,64 @@ def test_synthesize_and_play_does_not_wait_when_already_playing():
     assert tts.synthesized == ["Hello."]
 
 
+def test_synthesize_and_play_waits_after_synthesis_if_paused_mid_synthesis():
+    # Synthesis runs in a thread and can't be cancelled or checked
+    # mid-call -- if a pause lands while it's already in flight (a real
+    # race confirmed live: a segment logged 65ms after "pausing playback
+    # provisionally"), the wait-loop before synthesis starts won't catch
+    # it. Must also wait *after* synthesis, before logging/submitting.
+    active_reply = ActiveReply()
+    pump = FakePump()  # starts PLAYING
+
+    class PausingDuringSynthesisTTS:
+        sample_rate = 24_000
+
+        def synthesize(self, text: str) -> TTSResult:
+            pump.state = PlaybackState.PAUSED
+            return TTSResult(np.ones(len(text), dtype=np.float32), [])
+
+    async def _run():
+        task = asyncio.create_task(
+            _synthesize_and_play(
+                PausingDuringSynthesisTTS(), "Hello.", pump, active_reply
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert pump.submitted == []  # synthesis done, but still waiting to submit
+        pump.state = PlaybackState.PLAYING
+        await task
+
+    asyncio.run(_run())
+
+    assert len(pump.submitted) == 1
+
+
+def test_synthesize_and_play_discards_if_interrupted_while_waiting_after_synthesis():
+    active_reply = ActiveReply()
+    pump = FakePump()
+
+    class PausingDuringSynthesisTTS:
+        sample_rate = 24_000
+
+        def synthesize(self, text: str) -> TTSResult:
+            pump.state = PlaybackState.PAUSED
+            return TTSResult(np.ones(len(text), dtype=np.float32), [])
+
+    async def _run():
+        task = asyncio.create_task(
+            _synthesize_and_play(
+                PausingDuringSynthesisTTS(), "Hello.", pump, active_reply
+            )
+        )
+        await asyncio.sleep(0.05)
+        active_reply.interrupted = True
+        await task
+
+    asyncio.run(_run())
+
+    assert pump.submitted == []
+
+
 def test_synthesize_and_play_populates_heard_timeline():
     words = [
         WordTiming("Hi ", start=0.0, end=0.3),
