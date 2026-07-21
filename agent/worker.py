@@ -100,6 +100,18 @@ if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
     )
     logger.addHandler(_fh)
 
+# This module runs in both the parent worker process and every job
+# subprocess livekit-agents spawns, so each gets its own FileHandler above.
+# livekit-agents *also* forwards every job subprocess log record to the
+# parent over IPC (see ipc/log_queue.py) for console visibility -- and that
+# forwarded record still carries the subprocess's original pid/timestamp, so
+# without this it silently re-enters this same logger in the parent and
+# gets written to the file a second time (confirmed live: every job-process
+# log line appeared twice, byte-identical down to the pid). propagate=False
+# only stops that redundant round-trip for *this* logger -- other loggers
+# (e.g. livekit's own) still propagate normally for console output.
+logger.propagate = False
+
 
 async def _shutdown_active_reply(active_reply: ActiveReply, pump: PlaybackPump) -> None:
     """Called when a session is ending. An in-flight reply's LLM/TTS task
