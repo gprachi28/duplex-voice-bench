@@ -163,9 +163,9 @@ class PlaybackPump:
         drained_s = drained_samples / self._sample_rate
         wall_s = time.monotonic() - drain_start
         if drained_samples > 0:
-            # TEMPORARY diagnostic (INFO so it's visible without changing
-            # log level) -- investigating a live-observed discrepancy
-            # between expected and actual pause/resume position.
+            # INFO (not DEBUG) so this is visible without changing log
+            # level -- ratio near 1.0 confirms real-time-paced playback;
+            # this was how the pause/resume rewind math was verified live.
             logger.info(
                 "pump: drained %.2fs of audio in %.2fs wall-clock (ratio=%.2f)",
                 drained_s,
