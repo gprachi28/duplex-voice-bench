@@ -416,7 +416,16 @@ def _append_heard(active_reply: ActiveReply, history: list[dict[str, str]]) -> N
 # real interrupt, independent of waiting for SPEECH_END -- see
 # docs/superpowers/specs/2026-07-20-barge-in_heard_text.md for why
 # interrupted_at is stamped at speech start, not escalation time.
-PROVISIONAL_MUTE_S = 0.25
+#
+# Must exceed agent/vad.py's MIN_SILENCE_DURATION (0.3s): SPEECH_END can't
+# arrive before (sound duration + MIN_SILENCE_DURATION), so a shorter
+# value than that makes escalation always win the race regardless of how
+# brief the speech was -- confirmed live: at 0.25s, "escalating" fired on
+# every single real interruption and "resuming" (the false-positive path)
+# never fired once. Muting itself is unaffected by this value -- pump.
+# pause() always fires immediately on SPEECH_START -- only how long we
+# wait before committing to kill the LLM generation is delayed.
+PROVISIONAL_MUTE_S = 0.7
 
 
 def _escalate_barge_in(active_reply: ActiveReply, pump: PlaybackPump) -> None:
