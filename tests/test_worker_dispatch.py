@@ -15,7 +15,7 @@ import time
 import numpy as np
 import pytest
 
-from agent.playback import PlaybackPump
+from agent.playback import PlaybackPump, PlaybackState
 from agent.tts import TTSResult, WordTiming
 from agent.turn_gate import Continue, Fire
 from agent.worker import (
@@ -87,6 +87,7 @@ class FakePump:
     def __init__(self, pause_at: float = 0.0, resume_keep_count: int = 0) -> None:
         self.submitted: list[tuple[np.ndarray, list[WordTiming]]] = []
         self.calls: list[str] = []
+        self.state = PlaybackState.PLAYING
         self._pause_at = pause_at
         self._resume_keep_count = resume_keep_count
 
@@ -95,17 +96,21 @@ class FakePump:
 
     def pause(self) -> float:
         self.calls.append("pause")
+        self.state = PlaybackState.PAUSED
         return self._pause_at
 
     def resume(self, rewind_words: int = 2) -> int:
         self.calls.append("resume")
+        self.state = PlaybackState.PLAYING
         return self._resume_keep_count
 
     def stop(self) -> None:
         self.calls.append("stop")
+        self.state = PlaybackState.STOPPED
 
     def reset_for_new_reply(self) -> None:
         self.calls.append("reset")
+        self.state = PlaybackState.PLAYING
 
 
 def test_continue_result_skips_stt_llm_and_history():
@@ -389,6 +394,67 @@ def test_heard_text_interrupt_after_all_words_returns_full():
 def test_heard_text_none_interrupt_returns_empty():
     timeline = [HeardWord("Hello ", end=0.3)]
     assert heard_text(timeline, interrupted_at=None) == ""
+
+
+# --- Deferred synthesis while paused: confirmed live, sentences kept
+# getting synthesized (and logged) while the pump was provisionally
+# paused, sitting fully buffered and never draining a single frame. If
+# escalation then confirmed a real interrupt, that synthesis work (real
+# Kokoro/MLX compute) was thrown away entirely by pump.stop() -- wasted,
+# and confusing to read in the log ("TTS segment" implies it was heard).
+# _synthesize_and_play now waits for the pump to stop being paused
+# before calling the expensive tts_backend.synthesize() at all.
+
+
+def test_synthesize_and_play_waits_while_paused_then_synthesizes_after_resume():
+    tts = FakeTTS()
+    active_reply = ActiveReply()
+    pump = FakePump()
+    pump.state = PlaybackState.PAUSED
+
+    async def _run():
+        task = asyncio.create_task(
+            _synthesize_and_play(tts, "Hello.", pump, active_reply)
+        )
+        await asyncio.sleep(0.05)
+        assert tts.synthesized == []  # still waiting, hasn't synthesized yet
+        pump.state = PlaybackState.PLAYING
+        await task
+
+    asyncio.run(_run())
+
+    assert tts.synthesized == ["Hello."]
+    assert len(pump.submitted) == 1
+
+
+def test_synthesize_and_play_skips_synthesis_if_interrupted_while_waiting():
+    tts = FakeTTS()
+    active_reply = ActiveReply()
+    pump = FakePump()
+    pump.state = PlaybackState.PAUSED
+
+    async def _run():
+        task = asyncio.create_task(
+            _synthesize_and_play(tts, "Hello.", pump, active_reply)
+        )
+        await asyncio.sleep(0.05)
+        active_reply.interrupted = True
+        await task
+
+    asyncio.run(_run())
+
+    assert tts.synthesized == []
+    assert pump.submitted == []
+
+
+def test_synthesize_and_play_does_not_wait_when_already_playing():
+    tts = FakeTTS()
+    active_reply = ActiveReply()
+    pump = FakePump()  # defaults to PLAYING
+
+    asyncio.run(_synthesize_and_play(tts, "Hello.", pump, active_reply))
+
+    assert tts.synthesized == ["Hello."]
 
 
 def test_synthesize_and_play_populates_heard_timeline():

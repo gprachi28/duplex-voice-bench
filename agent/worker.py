@@ -28,7 +28,7 @@ from livekit.agents.vad import VADEventType
 
 from agent.audio import to_16k_mono_f32
 from agent.llm import LLMBackend, create_llm_backend
-from agent.playback import PlaybackPump
+from agent.playback import PlaybackPump, PlaybackState
 from agent.sentence_buffer import SentenceBuffer
 from agent.smart_turn import SmartTurnObserver, create_smart_turn_scorer
 from agent.stt import STTBackend, create_stt_backend
@@ -365,6 +365,9 @@ async def _consume_vad_events(
             first_inference_logged = True
 
 
+SYNTH_PAUSE_POLL_S = 0.02
+
+
 async def _synthesize_and_play(
     tts_backend: TTSBackend,
     text: str,
@@ -389,7 +392,18 @@ async def _synthesize_and_play(
     separate, wall-clock-estimated model from the pump's own
     submitted-sample-count clock (used for pause/resume rewind); both are
     built from the same result.words in the same order, so they stay
-    index-aligned -- see _disarm_escalation's heard_timeline truncation."""
+    index-aligned -- see _disarm_escalation's heard_timeline truncation.
+
+    While the pump is provisionally paused (see _arm_escalation), waits
+    here before calling the expensive tts_backend.synthesize() at all --
+    confirmed live, without this a sentence generated during the pause
+    window got fully synthesized (real Kokoro/MLX compute) and buffered
+    with zero chance of being heard if the pause escalated into a real
+    interrupt seconds later, thrown away by pump.stop()."""
+    while pump.state == PlaybackState.PAUSED and not active_reply.interrupted:
+        await asyncio.sleep(SYNTH_PAUSE_POLL_S)
+    if active_reply.interrupted:
+        return
     try:
         result = await asyncio.to_thread(tts_backend.synthesize, text)
     except Exception:
