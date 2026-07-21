@@ -451,6 +451,7 @@ def _arm_escalation(
         return
     active_reply.speech_started_at = time.monotonic()
     active_reply.paused_at = pump.pause()
+    logger.info("barge-in: pausing playback provisionally (speech detected)")
     loop = asyncio.get_running_loop()
     active_reply.escalation_handle = loop.call_later(
         delay_s, _escalate_barge_in, active_reply, pump
@@ -471,6 +472,9 @@ def _disarm_escalation(active_reply: ActiveReply, pump: PlaybackPump) -> None:
     active_reply.escalation_handle = None
     if active_reply.paused_at is not None:
         keep_count = pump.resume()
+        logger.info(
+            "barge-in: resuming playback (false alarm, rewound to word %d)", keep_count
+        )
         active_reply.heard_timeline = active_reply.heard_timeline[:keep_count]
         active_reply.paused_at = None
 
