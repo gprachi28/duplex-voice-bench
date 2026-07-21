@@ -152,3 +152,45 @@ def test_reset_for_new_reply_drops_audio_and_resumes_playing_state():
 
     assert pump._audio.size == 0
     assert pump._state == PlaybackState.PLAYING
+
+
+def test_state_property_reflects_current_state():
+    pump = PlaybackPump(_fake_capture([]), _fake_clear([]), SR)
+    assert pump.state == PlaybackState.PLAYING
+    pump.pause()
+    assert pump.state == PlaybackState.PAUSED
+    pump.stop()
+    assert pump.state == PlaybackState.STOPPED
+
+
+def test_stop_logs_discarded_audio_when_unplayed_remains(caplog):
+    # Confirmed live: segments synthesized while paused sat fully
+    # buffered (never drained) and got silently wiped by stop() when a
+    # provisional pause escalated into a real interrupt -- "some replies
+    # are logged but TTS never said it." Nothing in the log made that
+    # discard visible.
+    pump = PlaybackPump(_fake_capture([]), _fake_clear([]), SR)
+
+    async def _run():
+        pump.pause()
+        # Appended while paused -- never drains.
+        await pump.submit(np.ones(FRAME_SAMPLES * 5, dtype=np.float32), [])
+        with caplog.at_level("INFO"):
+            pump.stop()
+
+    asyncio.run(_run())
+
+    assert any("discard" in r.message.lower() for r in caplog.records)
+
+
+def test_stop_does_not_log_discard_when_nothing_unplayed(caplog):
+    pump = PlaybackPump(_fake_capture([]), _fake_clear([]), SR)
+
+    async def _run():
+        await pump.submit(np.ones(FRAME_SAMPLES, dtype=np.float32), [])  # fully drains
+        with caplog.at_level("INFO"):
+            pump.stop()
+
+    asyncio.run(_run())
+
+    assert not any("discard" in r.message.lower() for r in caplog.records)

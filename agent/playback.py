@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import logging
+import time
 from collections.abc import Awaitable, Callable
 
 import numpy as np
 
 from agent.tts import WordTiming
+
+logger = logging.getLogger("voice-agent-worker")
 
 FRAME_MS = 20
 RESUME_REWIND_WORDS = 2
@@ -73,6 +77,10 @@ class PlaybackPump:
         self._submitted_samples = 0
         self._state = PlaybackState.PLAYING
 
+    @property
+    def state(self) -> PlaybackState:
+        return self._state
+
     async def submit(self, audio: np.ndarray, words: list[WordTiming]) -> None:
         """Append one synthesized segment's audio + word alignment
         (offset into this reply's running timeline) and, if playing,
@@ -111,7 +119,14 @@ class PlaybackPump:
 
     def stop(self) -> None:
         """Hard stop: flush the queue and drop all retained audio --
-        there's nothing to resume to."""
+        there's nothing to resume to. Logs how much synthesized-but-
+        never-played audio is being thrown away, if any -- confirmed
+        live, segments synthesized while paused sat fully buffered
+        (never drained) and got silently wiped here, which read from the
+        log as "TTS segment logged" but was never actually heard."""
+        unplayed_s = (len(self._audio) - self._submitted_samples) / self._sample_rate
+        if unplayed_s > 0:
+            logger.info("pump: discarding %.2fs of unplayed audio on stop", unplayed_s)
         self._clear_queue()
         self._drop_audio()
         self._state = PlaybackState.STOPPED
@@ -133,6 +148,8 @@ class PlaybackPump:
         backpressure. Stops early if paused/stopped mid-drain (checked
         between frames, since asyncio is cooperative -- pause()/stop()
         can only run between our awaits)."""
+        drain_start = time.monotonic()
+        start_sample = self._submitted_samples
         while (
             self._state == PlaybackState.PLAYING
             and self._submitted_samples < len(self._audio)
@@ -142,3 +159,16 @@ class PlaybackPump:
             ]
             await self._capture_frame(frame)
             self._submitted_samples += len(frame)
+        drained_samples = self._submitted_samples - start_sample
+        drained_s = drained_samples / self._sample_rate
+        wall_s = time.monotonic() - drain_start
+        if drained_samples > 0:
+            # TEMPORARY diagnostic (INFO so it's visible without changing
+            # log level) -- investigating a live-observed discrepancy
+            # between expected and actual pause/resume position.
+            logger.info(
+                "pump: drained %.2fs of audio in %.2fs wall-clock (ratio=%.2f)",
+                drained_s,
+                wall_s,
+                wall_s / drained_s if drained_s else 0.0,
+            )
