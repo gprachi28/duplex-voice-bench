@@ -18,6 +18,7 @@ mid-capture_frame()).
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -27,14 +28,21 @@ from livekit import agents, rtc
 from livekit.agents.vad import VADEventType
 
 from agent.audio import to_16k_mono_f32
-from agent.llm import LLMBackend, create_llm_backend
+from agent.llm import OLLAMA_MODEL, LLMBackend, create_llm_backend
+from agent.metrics import DEFAULT_METRICS_LOG_PATH, TurnMetrics, append_turn_metrics
 from agent.playback import PlaybackPump, PlaybackState
 from agent.sentence_buffer import SentenceBuffer
 from agent.smart_turn import SmartTurnObserver, create_smart_turn_scorer
-from agent.stt import STTBackend, create_stt_backend
-from agent.tts import TTSBackend, create_tts_backend
+from agent.stt import WHISPER_MODEL, STTBackend, create_stt_backend
+from agent.tts import KOKORO_REPO, TTSBackend, create_tts_backend
 from agent.turn_gate import Continue, ForceFire, GateResult, TurnGate, create_turn_gate
 from agent.vad import create_vad
+
+METRICS_LOG_PATH = os.environ.get("METRICS_LOG_PATH", DEFAULT_METRICS_LOG_PATH)
+# Static for now -- no runtime backend-switching exists yet, so this always
+# reflects the one hardcoded combination. See design.md's "Benchmark
+# Combinations" table for where this is headed.
+COMBINATION_ID = f"{WHISPER_MODEL}|{OLLAMA_MODEL}|{KOKORO_REPO}"
 
 
 @dataclass
@@ -84,6 +92,8 @@ class ActiveReply:
     speech_started_at: float | None = None
     escalation_handle: asyncio.TimerHandle | None = None
     paused_at: float | None = None
+    room: str = ""
+    turn_count: int = 0
 
 
 load_dotenv()
@@ -181,7 +191,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
     await ctx.room.local_participant.publish_track(out_track)
-    logger.info("joined room=%s, published agent-reply track", ctx.room.name)
+    room_name = ctx.room.name
+    logger.info("joined room=%s, published agent-reply track", room_name)
 
     remote_track, remote_p = await remote_audio.get()
     logger.info("listening to remote audio from %s", remote_p.identity)
@@ -205,7 +216,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # list/lock/reply-tracker per room job, or state would leak across rooms.
     history: list[dict[str, str]] = []
     history_lock = asyncio.Lock()
-    active_reply = ActiveReply()
+    active_reply = ActiveReply(room=room_name)
 
     vad_stream = create_vad().stream()
     vad_task = asyncio.create_task(
@@ -289,7 +300,8 @@ async def _ingest(
         if turn_gate.push(mono_16k):
             # Max utterance duration crossed — force-fire without waiting
             # for a Silero END_OF_SPEECH a long monologue might never produce.
-            result = turn_gate.evaluate(turn_observer.latest_probability)
+            prob = turn_observer.latest_probability
+            result = turn_gate.evaluate(prob)
             asyncio.create_task(
                 _dispatch_gate_result(
                     result,
@@ -300,6 +312,8 @@ async def _ingest(
                     history_lock,
                     active_reply,
                     pump,
+                    t0=time.monotonic(),
+                    smart_turn_prob=prob,
                 )
             )
 
@@ -354,6 +368,7 @@ async def _consume_vad_events(
         elif event.type == VADEventType.END_OF_SPEECH:
             _disarm_escalation(active_reply, pump)
             prob = turn_observer.latest_probability
+            t0 = time.monotonic()
             logger.info(
                 "SPEECH_END (duration=%.2fs) smart_turn_prob=%.2f",
                 event.speech_duration,
@@ -370,6 +385,8 @@ async def _consume_vad_events(
                     history_lock,
                     active_reply,
                     pump,
+                    t0=t0,
+                    smart_turn_prob=prob,
                 )
             )
         elif event.type == VADEventType.INFERENCE_DONE and not first_inference_logged:
@@ -392,6 +409,7 @@ async def _synthesize_and_play(
     text: str,
     pump: PlaybackPump,
     active_reply: ActiveReply,
+    metrics: TurnMetrics | None = None,
 ) -> None:
     """Synthesize one sentence-buffer-flushed segment and submit it to the
     playback pump. A failed segment is logged and skipped rather than
@@ -422,7 +440,15 @@ async def _synthesize_and_play(
     be cancelled or checked mid-call, so a pause can also land *while*
     it's already in flight (confirmed live: a segment logged 65ms after
     "pausing playback provisionally") -- waited for again after
-    synthesis completes, before logging/submitting, to close that race."""
+    synthesis completes, before logging/submitting, to close that race.
+
+    metrics is optional so existing callers/tests that don't instrument a
+    turn keep working unchanged. When given, stamps t4 (first sentence
+    handed to TTS) and t5 (first audio actually submitted) only once per
+    turn -- a turn spans multiple segments/calls, and only the first
+    matters for TTFA."""
+    if metrics is not None and metrics.t4 is None:
+        metrics.t4 = time.monotonic()
     await _wait_while_paused(pump, active_reply)
     if active_reply.interrupted:
         return
@@ -456,6 +482,8 @@ async def _synthesize_and_play(
             word_text = " " + word_text
         active_reply.heard_timeline.append(HeardWord(word_text, seg_start + word.end))
     active_reply.playback_cursor = seg_start + len(result.audio) / tts_backend.sample_rate
+    if metrics is not None and metrics.t5 is None:
+        metrics.t5 = time.monotonic()
     await pump.submit(result.audio, result.words)
 
 
@@ -572,6 +600,8 @@ async def _dispatch_gate_result(
     history_lock: asyncio.Lock,
     active_reply: ActiveReply,
     pump: PlaybackPump,
+    t0: float | None = None,
+    smart_turn_prob: float | None = None,
 ) -> None:
     """Handle a TurnGate decision: log-and-return on Continue, transcribe
     and log the transcript on Fire/ForceFire, then stream an LLM reply,
@@ -594,6 +624,13 @@ async def _dispatch_gate_result(
     serialization mechanism: interrupting the predecessor and awaiting
     its exit guarantees the lock is free by the time this turn tries to
     acquire it.
+
+    t0/smart_turn_prob default to None so existing callers/tests that
+    don't instrument a turn keep working unchanged -- see agent/metrics.py.
+    A metrics record is only written when t0 is given (real dispatch sites
+    always give one); the finally block emits it on every exit path
+    (success, STT/LLM failure, or barge-in), with un-reached stages left
+    null, so a JSONL line always exists for every Fire/ForceFire turn.
     """
     if isinstance(result, Continue):
         logger.info("turn incomplete, continuing to listen")
@@ -622,55 +659,72 @@ async def _dispatch_gate_result(
     _disarm_escalation(active_reply, pump)
     pump.reset_for_new_reply()
 
+    active_reply.turn_count += 1
     forced = isinstance(result, ForceFire)
-    if forced:
-        logger.warning("max utterance duration exceeded, forcing STT")
+    metrics = TurnMetrics(
+        turn_id=f"{active_reply.room}-{active_reply.turn_count}",
+        room=active_reply.room,
+        combination_id=COMBINATION_ID,
+        t0=t0,
+        forced=forced,
+        smart_turn_prob=smart_turn_prob,
+    )
     try:
-        text = await asyncio.to_thread(stt_backend.transcribe, result.audio)
-    except Exception:
-        logger.exception("STT transcription failed")
-        return
-    logger.info("TRANSCRIPT (%s): %r", "forced" if forced else "confirmed", text)
-
-    async with history_lock:
-        history.append({"role": "user", "content": text})
-        sentence_buffer = SentenceBuffer()
+        if forced:
+            logger.warning("max utterance duration exceeded, forcing STT")
         try:
-            start = time.monotonic()
-            first_chunk = True
-            chunks: list[str] = []
-            async for chunk in llm_backend.stream_chat(history):
-                if _check_interrupted(active_reply):
-                    _append_heard(active_reply, history)
-                    return
-                if first_chunk:
-                    logger.info("LLM TTFT: %.3fs", time.monotonic() - start)
-                    first_chunk = False
-                chunks.append(chunk)
-                for sentence in sentence_buffer.push(chunk):
-                    await _synthesize_and_play(
-                        tts_backend, sentence, pump, active_reply
-                    )
+            metrics.t1 = time.monotonic()
+            text = await asyncio.to_thread(stt_backend.transcribe, result.audio)
+        except Exception:
+            logger.exception("STT transcription failed")
+            return
+        metrics.t2 = time.monotonic()
+        logger.info("TRANSCRIPT (%s): %r", "forced" if forced else "confirmed", text)
+
+        async with history_lock:
+            history.append({"role": "user", "content": text})
+            sentence_buffer = SentenceBuffer()
+            try:
+                start = time.monotonic()
+                first_chunk = True
+                chunks: list[str] = []
+                async for chunk in llm_backend.stream_chat(history):
                     if _check_interrupted(active_reply):
                         _append_heard(active_reply, history)
                         return
-        except Exception:
-            # The user turn stays in history unanswered; the next turn's
-            # request will just include two consecutive user messages,
-            # which chat-tuned models tolerate.
-            logger.exception("LLM streaming failed")
-            return
-        remainder = sentence_buffer.flush()
-        if remainder:
-            await _synthesize_and_play(
-                tts_backend, remainder, pump, active_reply
-            )
-            if _check_interrupted(active_reply):
-                _append_heard(active_reply, history)
+                    if first_chunk:
+                        metrics.t3 = time.monotonic()
+                        logger.info("LLM TTFT: %.3fs", metrics.t3 - start)
+                        first_chunk = False
+                    chunks.append(chunk)
+                    for sentence in sentence_buffer.push(chunk):
+                        await _synthesize_and_play(
+                            tts_backend, sentence, pump, active_reply, metrics
+                        )
+                        if _check_interrupted(active_reply):
+                            _append_heard(active_reply, history)
+                            return
+            except Exception:
+                # The user turn stays in history unanswered; the next turn's
+                # request will just include two consecutive user messages,
+                # which chat-tuned models tolerate.
+                logger.exception("LLM streaming failed")
                 return
+            remainder = sentence_buffer.flush()
+            if remainder:
+                await _synthesize_and_play(
+                    tts_backend, remainder, pump, active_reply, metrics
+                )
+                if _check_interrupted(active_reply):
+                    _append_heard(active_reply, history)
+                    return
         response = "".join(chunks)
         history.append({"role": "assistant", "content": response})
         logger.info("LLM RESPONSE: %r", response)
+    finally:
+        metrics.interrupted = active_reply.interrupted
+        if t0 is not None:
+            append_turn_metrics(METRICS_LOG_PATH, metrics)
 
 
 def _prewarm(proc: agents.JobProcess) -> None:
