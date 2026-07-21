@@ -15,6 +15,7 @@ import time
 import numpy as np
 import pytest
 
+from agent.playback import PlaybackPump
 from agent.tts import TTSResult, WordTiming
 from agent.turn_gate import Continue, Fire
 from agent.worker import (
@@ -76,28 +77,40 @@ class FakeTTS:
         return TTSResult(np.ones(len(text), dtype=np.float32), self._words)
 
 
-def _recording_player(sink: list[np.ndarray]):
-    async def play(audio: np.ndarray) -> None:
-        sink.append(audio)
+class FakePump:
+    """Test double for PlaybackPump -- records what would have played and
+    what control calls (pause/resume/stop/reset) were made, without any
+    real audio submission or timing. pause_at/resume_keep_count let a
+    test dictate what a real pump would have computed and estimated."""
 
-    return play
+    def __init__(self, pause_at: float = 0.0, resume_keep_count: int = 0) -> None:
+        self.submitted: list[tuple[np.ndarray, list[WordTiming]]] = []
+        self.calls: list[str] = []
+        self._pause_at = pause_at
+        self._resume_keep_count = resume_keep_count
 
+    async def submit(self, audio: np.ndarray, words: list[WordTiming]) -> None:
+        self.submitted.append((audio, words))
 
-def _noop_clear_audio() -> None:
-    pass
+    def pause(self) -> float:
+        self.calls.append("pause")
+        return self._pause_at
 
+    def resume(self, rewind_words: int = 2) -> int:
+        self.calls.append("resume")
+        return self._resume_keep_count
 
-def _recording_clear_audio(sink: list[str]):
-    def clear() -> None:
-        sink.append("clear_audio")
+    def stop(self) -> None:
+        self.calls.append("stop")
 
-    return clear
+    def reset_for_new_reply(self) -> None:
+        self.calls.append("reset")
 
 
 def test_continue_result_skips_stt_llm_and_history():
     llm = FakeLLM(["should not be called"])
     tts = FakeTTS()
-    played: list[np.ndarray] = []
+    pump = FakePump()
     history: list[dict[str, str]] = []
     asyncio.run(
         _dispatch_gate_result(
@@ -108,20 +121,18 @@ def test_continue_result_skips_stt_llm_and_history():
             history,
             asyncio.Lock(),
             ActiveReply(),
-            _recording_player(played),
-            _noop_clear_audio,
+            pump,
         )
     )
     assert llm.calls == []
     assert history == []
     assert tts.synthesized == []
-    assert played == []
+    assert pump.submitted == []
 
 
 def test_fire_appends_user_then_assistant_turn():
     llm = FakeLLM(["Hel", "lo!"])
     tts = FakeTTS()
-    played: list[np.ndarray] = []
     history: list[dict[str, str]] = []
     asyncio.run(
         _dispatch_gate_result(
@@ -132,8 +143,7 @@ def test_fire_appends_user_then_assistant_turn():
             history,
             asyncio.Lock(),
             ActiveReply(),
-            _recording_player(played),
-            _noop_clear_audio,
+            FakePump(),
         )
     )
     assert history == [
@@ -145,7 +155,6 @@ def test_fire_appends_user_then_assistant_turn():
 def test_fire_sends_full_prior_history_to_llm():
     llm = FakeLLM(["ok"])
     tts = FakeTTS()
-    played: list[np.ndarray] = []
     history: list[dict[str, str]] = [
         {"role": "user", "content": "earlier turn"},
         {"role": "assistant", "content": "earlier reply"},
@@ -159,8 +168,7 @@ def test_fire_sends_full_prior_history_to_llm():
             history,
             asyncio.Lock(),
             ActiveReply(),
-            _recording_player(played),
-            _noop_clear_audio,
+            FakePump(),
         )
     )
     assert llm.calls == [
@@ -175,7 +183,7 @@ def test_fire_sends_full_prior_history_to_llm():
 def test_fire_flushes_tts_mid_stream_on_sentence_boundary_in_order():
     llm = FakeLLM(["This is one sentence. ", "This is another sentence."])
     tts = FakeTTS()
-    played: list[np.ndarray] = []
+    pump = FakePump()
     history: list[dict[str, str]] = []
     asyncio.run(
         _dispatch_gate_result(
@@ -186,18 +194,17 @@ def test_fire_flushes_tts_mid_stream_on_sentence_boundary_in_order():
             history,
             asyncio.Lock(),
             ActiveReply(),
-            _recording_player(played),
-            _noop_clear_audio,
+            pump,
         )
     )
     assert tts.synthesized == ["This is one sentence.", "This is another sentence."]
-    assert len(played) == 2
+    assert len(pump.submitted) == 2
 
 
 def test_fire_keeps_history_when_tts_synthesis_fails(caplog):
     llm = FakeLLM(["Hello there, this is a longer reply."])
     tts = FakeTTS(fail=True)
-    played: list[np.ndarray] = []
+    pump = FakePump()
     history: list[dict[str, str]] = []
     with caplog.at_level("ERROR"):
         asyncio.run(
@@ -209,26 +216,22 @@ def test_fire_keeps_history_when_tts_synthesis_fails(caplog):
                 history,
                 asyncio.Lock(),
                 ActiveReply(),
-                _recording_player(played),
-                _noop_clear_audio,
+                pump,
             )
         )
     assert history == [
         {"role": "user", "content": "hi there"},
         {"role": "assistant", "content": "Hello there, this is a longer reply."},
     ]
-    assert played == []
+    assert pump.submitted == []
 
 
 def test_barge_in_interrupts_in_flight_reply_and_completes_new_turn(caplog):
     tts = FakeTTS()
-    played: list[np.ndarray] = []
     history: list[dict[str, str]] = []
     lock = asyncio.Lock()
     active_reply = ActiveReply()
-    play = _recording_player(played)
-    clear_calls: list[str] = []
-    clear_audio = _recording_clear_audio(clear_calls)
+    pump = FakePump()
 
     async def _run_both():
         first = asyncio.create_task(
@@ -240,8 +243,7 @@ def test_barge_in_interrupts_in_flight_reply_and_completes_new_turn(caplog):
                 history,
                 lock,
                 active_reply,
-                play,
-                clear_audio,
+                pump,
             )
         )
         await asyncio.sleep(0.05)
@@ -254,8 +256,7 @@ def test_barge_in_interrupts_in_flight_reply_and_completes_new_turn(caplog):
                 history,
                 lock,
                 active_reply,
-                play,
-                clear_audio,
+                pump,
             )
         )
         await asyncio.gather(first, second)
@@ -272,7 +273,7 @@ def test_barge_in_interrupts_in_flight_reply_and_completes_new_turn(caplog):
         {"role": "assistant", "content": "second-reply"},
     ]
     assert tts.synthesized == ["second-reply"]
-    assert clear_calls == ["clear_audio"]
+    assert pump.calls.count("stop") == 1
     assert any(
         "barge-in: interrupting in-flight reply" in r.message
         for r in caplog.records
@@ -287,8 +288,7 @@ def test_barge_in_discards_audio_synthesized_after_interruption_flagged():
     synthesize+play unit (which lets one full segment play after every
     barge-in, audible as the agent talking over the user)."""
     active_reply = ActiveReply()
-    played: list[np.ndarray] = []
-    play = _recording_player(played)
+    pump = FakePump()
     history: list[dict[str, str]] = []
 
     class InterruptingTTS:
@@ -309,23 +309,19 @@ def test_barge_in_discards_audio_synthesized_after_interruption_flagged():
             history,
             asyncio.Lock(),
             active_reply,
-            play,
-            _noop_clear_audio,
+            pump,
         )
     )
-    assert played == []
+    assert pump.submitted == []
     assert history == [{"role": "user", "content": "hi there"}]
 
 
 def test_barging_in_on_an_already_finished_reply_is_a_noop():
     tts = FakeTTS()
-    played: list[np.ndarray] = []
     history: list[dict[str, str]] = []
     lock = asyncio.Lock()
     active_reply = ActiveReply()
-    play = _recording_player(played)
-    clear_calls: list[str] = []
-    clear_audio = _recording_clear_audio(clear_calls)
+    pump = FakePump()
 
     async def _run_sequential():
         first = asyncio.create_task(
@@ -337,8 +333,7 @@ def test_barging_in_on_an_already_finished_reply_is_a_noop():
                 history,
                 lock,
                 active_reply,
-                play,
-                clear_audio,
+                pump,
             )
         )
         await first
@@ -351,8 +346,7 @@ def test_barging_in_on_an_already_finished_reply_is_a_noop():
                 history,
                 lock,
                 active_reply,
-                play,
-                clear_audio,
+                pump,
             )
         )
         await second
@@ -365,7 +359,7 @@ def test_barging_in_on_an_already_finished_reply_is_a_noop():
         {"role": "user", "content": "second"},
         {"role": "assistant", "content": "second-reply"},
     ]
-    assert clear_calls == []
+    assert "stop" not in pump.calls
 
 
 def test_heard_text_returns_words_up_to_interrupt():
@@ -403,11 +397,10 @@ def test_synthesize_and_play_populates_heard_timeline():
     ]
     tts = FakeTTS(words=words)
     active_reply = ActiveReply()
-    played: list[np.ndarray] = []
-    play = _recording_player(played)
+    pump = FakePump()
 
     before = time.monotonic()
-    asyncio.run(_synthesize_and_play(tts, "Hi there.", play, active_reply))
+    asyncio.run(_synthesize_and_play(tts, "Hi there.", pump, active_reply))
     after = time.monotonic()
 
     assert [w.text for w in active_reply.heard_timeline] == ["Hi ", "there."]
@@ -422,6 +415,7 @@ def test_synthesize_and_play_populates_heard_timeline():
         <= active_reply.playback_cursor
         <= after + expected_audio_duration
     )
+    assert len(pump.submitted) == 1
 
 
 def test_barge_in_mid_playback_appends_truncated_prefix():
@@ -436,11 +430,10 @@ def test_barge_in_mid_playback_appends_truncated_prefix():
         WordTiming("greeting.", start=0.08, end=0.10),
     ]
     tts = FakeTTS(words=words)
-    played: list[np.ndarray] = []
     history: list[dict[str, str]] = []
     lock = asyncio.Lock()
     active_reply = ActiveReply()
-    play = _recording_player(played)
+    pump = FakePump()
 
     full_reply = "This is a longer greeting. This is more."
 
@@ -458,8 +451,7 @@ def test_barge_in_mid_playback_appends_truncated_prefix():
                 history,
                 lock,
                 active_reply,
-                play,
-                _noop_clear_audio,
+                pump,
             )
         )
         # First's mid-delay (0.2s) is well past the point its first segment
@@ -476,8 +468,7 @@ def test_barge_in_mid_playback_appends_truncated_prefix():
                 history,
                 lock,
                 active_reply,
-                play,
-                _noop_clear_audio,
+                pump,
             )
         )
         await asyncio.gather(first, second)
@@ -495,11 +486,10 @@ def test_barge_in_mid_playback_appends_truncated_prefix():
 
 def test_new_reply_resets_heard_timeline_and_cursor():
     tts = FakeTTS(words=[WordTiming("Hi ", start=0.0, end=0.02)])
-    played: list[np.ndarray] = []
     history: list[dict[str, str]] = []
     lock = asyncio.Lock()
     active_reply = ActiveReply()
-    play = _recording_player(played)
+    pump = FakePump()
 
     async def _run_sequential():
         first = asyncio.create_task(
@@ -511,8 +501,7 @@ def test_new_reply_resets_heard_timeline_and_cursor():
                 history,
                 lock,
                 active_reply,
-                play,
-                _noop_clear_audio,
+                pump,
             )
         )
         await first
@@ -525,8 +514,7 @@ def test_new_reply_resets_heard_timeline_and_cursor():
                 history,
                 lock,
                 active_reply,
-                play,
-                _noop_clear_audio,
+                pump,
             )
         )
         await second
@@ -538,6 +526,7 @@ def test_new_reply_resets_heard_timeline_and_cursor():
     # words (2 entries) instead of just its own (1).
     assert len(active_reply.heard_timeline) == 1
     assert active_reply.playback_cursor > 0.0
+    assert pump.calls.count("reset") == 2
 
 
 def test_synthesize_and_play_inserts_space_between_segments():
@@ -548,11 +537,10 @@ def test_synthesize_and_play_inserts_space_between_segments():
     # "Hello!Hello!" once joined.
     tts = FakeTTS(words=[WordTiming("Hello!", start=0.0, end=0.3)])
     active_reply = ActiveReply()
-    played: list[np.ndarray] = []
-    play = _recording_player(played)
+    pump = FakePump()
 
-    asyncio.run(_synthesize_and_play(tts, "Hello!", play, active_reply))
-    asyncio.run(_synthesize_and_play(tts, "Hello!", play, active_reply))
+    asyncio.run(_synthesize_and_play(tts, "Hello!", pump, active_reply))
+    asyncio.run(_synthesize_and_play(tts, "Hello!", pump, active_reply))
 
     joined = "".join(w.text for w in active_reply.heard_timeline)
     assert joined == "Hello! Hello!"
@@ -568,7 +556,14 @@ def test_synthesize_and_play_inserts_space_between_segments():
 # _escalate_barge_in add a wall-clock timer, started at VAD SPEECH_START
 # independent of waiting for Smart Turn, that commits to interrupting the
 # reply if speech is sustained past the timer -- reusing the exact
-# interrupted/clear_audio/heard_text machinery already verified above.
+# interrupted/heard_text machinery already verified above.
+#
+# --- Phase 3: the timer's arm/disarm now also pauses/resumes playback
+# (via the pump) instead of only gating the hard interrupt, so the agent
+# goes quiet immediately on any detected speech and, if it turns out to
+# be brief, resumes with a word-boundary rewind instead of talking
+# through it (Phase 1) or staying interrupted regardless (a plain
+# mute-and-commit). See docs/superpowers/specs/2026-07-20-barge-in_heard_text.md.
 
 
 async def _pending_task() -> asyncio.Task:
@@ -583,54 +578,55 @@ async def _cancel(task: asyncio.Task) -> None:
 
 def test_escalate_barge_in_interrupts_active_reply():
     active_reply = ActiveReply()
-    clear_calls: list[str] = []
-    clear_audio = _recording_clear_audio(clear_calls)
+    pump = FakePump()
 
     async def _run():
         active_reply.task = await _pending_task()
         active_reply.speech_started_at = 123.0
-        _escalate_barge_in(active_reply, clear_audio)
+        _escalate_barge_in(active_reply, pump)
         await _cancel(active_reply.task)
 
     asyncio.run(_run())
 
     assert active_reply.interrupted is True
     assert active_reply.interrupted_at == 123.0
-    assert clear_calls == ["clear_audio"]
+    assert pump.calls == ["stop"]
     assert active_reply.escalation_handle is None
+    assert active_reply.paused_at is None
 
 
 def test_escalate_barge_in_noop_when_no_active_reply():
     active_reply = ActiveReply()
-    clear_calls: list[str] = []
+    pump = FakePump()
 
-    _escalate_barge_in(active_reply, _recording_clear_audio(clear_calls))
+    _escalate_barge_in(active_reply, pump)
 
     assert active_reply.interrupted is False
-    assert clear_calls == []
+    assert pump.calls == []
 
 
 def test_escalate_barge_in_noop_when_task_already_done():
     active_reply = ActiveReply()
-    clear_calls: list[str] = []
+    pump = FakePump()
 
     async def _run():
         active_reply.task = asyncio.create_task(asyncio.sleep(0))
         await active_reply.task
 
     asyncio.run(_run())
-    _escalate_barge_in(active_reply, _recording_clear_audio(clear_calls))
+    _escalate_barge_in(active_reply, pump)
 
     assert active_reply.interrupted is False
-    assert clear_calls == []
+    assert pump.calls == []
 
 
-def test_arm_escalation_starts_timer_when_reply_active():
+def test_arm_escalation_starts_timer_and_pauses_when_reply_active():
     active_reply = ActiveReply()
+    pump = FakePump(pause_at=1.5)
 
     async def _run():
         active_reply.task = await _pending_task()
-        _arm_escalation(active_reply, _noop_clear_audio, delay_s=10.0)
+        _arm_escalation(active_reply, pump, delay_s=10.0)
         assert active_reply.escalation_handle is not None
         assert active_reply.speech_started_at is not None
         active_reply.escalation_handle.cancel()
@@ -638,86 +634,116 @@ def test_arm_escalation_starts_timer_when_reply_active():
 
     asyncio.run(_run())
 
+    assert pump.calls == ["pause"]
+    assert active_reply.paused_at == 1.5
+
 
 def test_arm_escalation_noop_when_no_reply_active():
     active_reply = ActiveReply()
+    pump = FakePump()
 
     async def _run():
-        _arm_escalation(active_reply, _noop_clear_audio, delay_s=10.0)
+        _arm_escalation(active_reply, pump, delay_s=10.0)
 
     asyncio.run(_run())
 
     assert active_reply.escalation_handle is None
     assert active_reply.speech_started_at is None
+    assert pump.calls == []
 
 
 def test_arm_escalation_noop_when_already_interrupted():
     active_reply = ActiveReply()
+    pump = FakePump()
 
     async def _run():
         active_reply.task = await _pending_task()
         active_reply.interrupted = True
-        _arm_escalation(active_reply, _noop_clear_audio, delay_s=10.0)
+        _arm_escalation(active_reply, pump, delay_s=10.0)
         await _cancel(active_reply.task)
 
     asyncio.run(_run())
 
     assert active_reply.escalation_handle is None
+    assert pump.calls == []
 
 
 def test_disarm_escalation_cancels_pending_timer():
     active_reply = ActiveReply()
+    pump = FakePump()
 
     async def _run():
         loop = asyncio.get_running_loop()
         active_reply.escalation_handle = loop.call_later(10.0, lambda: None)
-        _disarm_escalation(active_reply)
+        _disarm_escalation(active_reply, pump)
 
     asyncio.run(_run())
 
     assert active_reply.escalation_handle is None
 
 
+def test_disarm_escalation_resumes_when_paused_and_truncates_heard_timeline():
+    active_reply = ActiveReply()
+    active_reply.paused_at = 0.5
+    active_reply.heard_timeline = [
+        HeardWord("W0 ", end=1.0),
+        HeardWord("W1 ", end=1.1),
+        HeardWord("W2 ", end=1.2),
+    ]
+    pump = FakePump(resume_keep_count=1)
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        active_reply.escalation_handle = loop.call_later(10.0, lambda: None)
+        _disarm_escalation(active_reply, pump)
+
+    asyncio.run(_run())
+
+    assert pump.calls == ["resume"]
+    assert active_reply.paused_at is None
+    assert [w.text for w in active_reply.heard_timeline] == ["W0 "]
+
+
 def test_disarm_escalation_noop_when_nothing_armed():
     active_reply = ActiveReply()
-    _disarm_escalation(active_reply)
+    pump = FakePump()
+    _disarm_escalation(active_reply, pump)
     assert active_reply.escalation_handle is None
+    assert pump.calls == []
 
 
 def test_sustained_speech_escalates_after_delay():
     active_reply = ActiveReply()
-    clear_calls: list[str] = []
-    clear_audio = _recording_clear_audio(clear_calls)
+    pump = FakePump()
 
     async def _run():
         active_reply.task = await _pending_task()
-        _arm_escalation(active_reply, clear_audio, delay_s=0.02)
+        _arm_escalation(active_reply, pump, delay_s=0.02)
         await asyncio.sleep(0.06)
         await _cancel(active_reply.task)
 
     asyncio.run(_run())
 
     assert active_reply.interrupted is True
-    assert clear_calls == ["clear_audio"]
+    assert pump.calls == ["pause", "stop"]
 
 
-def test_early_disarm_prevents_escalation():
+def test_early_disarm_prevents_escalation_and_resumes():
     active_reply = ActiveReply()
-    clear_calls: list[str] = []
-    clear_audio = _recording_clear_audio(clear_calls)
+    pump = FakePump(resume_keep_count=0)
 
     async def _run():
         active_reply.task = await _pending_task()
-        _arm_escalation(active_reply, clear_audio, delay_s=0.02)
+        _arm_escalation(active_reply, pump, delay_s=0.02)
         await asyncio.sleep(0.005)
-        _disarm_escalation(active_reply)
+        _disarm_escalation(active_reply, pump)
         await asyncio.sleep(0.05)  # well past the original delay
         await _cancel(active_reply.task)
 
     asyncio.run(_run())
 
     assert active_reply.interrupted is False
-    assert clear_calls == []
+    assert pump.calls == ["pause", "resume"]
 
 
 def test_barge_in_does_not_overwrite_interrupted_at_set_by_escalation():
@@ -730,10 +756,7 @@ def test_barge_in_does_not_overwrite_interrupted_at_set_by_escalation():
     history: list[dict[str, str]] = []
     lock = asyncio.Lock()
     active_reply = ActiveReply()
-    played: list[np.ndarray] = []
-    play = _recording_player(played)
-    clear_calls: list[str] = []
-    clear_audio = _recording_clear_audio(clear_calls)
+    pump = FakePump()
 
     async def _run():
         first = asyncio.create_task(
@@ -745,8 +768,7 @@ def test_barge_in_does_not_overwrite_interrupted_at_set_by_escalation():
                 history,
                 lock,
                 active_reply,
-                play,
-                clear_audio,
+                pump,
             )
         )
         await asyncio.sleep(0.02)
@@ -754,7 +776,7 @@ def test_barge_in_does_not_overwrite_interrupted_at_set_by_escalation():
         # gets a chance to run its barge-in block.
         active_reply.interrupted = True
         active_reply.interrupted_at = 12345.0
-        clear_audio()
+        pump.stop()
 
         second = asyncio.create_task(
             _dispatch_gate_result(
@@ -765,15 +787,48 @@ def test_barge_in_does_not_overwrite_interrupted_at_set_by_escalation():
                 history,
                 lock,
                 active_reply,
-                play,
-                clear_audio,
+                pump,
             )
         )
         await asyncio.gather(first, second)
 
     asyncio.run(_run())
 
-    # Only the simulated escalation should have cleared audio -- the
-    # second dispatch's own barge-in block must not re-clear or re-stamp
+    # Only the simulated escalation should have stopped the pump -- the
+    # second dispatch's own barge-in block must not re-stop or re-stamp
     # interrupted_at once it sees active_reply is already interrupted.
-    assert clear_calls == ["clear_audio"]
+    assert pump.calls.count("stop") == 1
+
+
+def test_pause_resume_keeps_heard_timeline_index_aligned_with_real_pump():
+    """Integration check with the real PlaybackPump (not FakePump):
+    _synthesize_and_play builds heard_timeline and the pump's own word
+    list from the same result.words in the same order, so truncating
+    heard_timeline by the pump's resume() keep_count must land on the
+    same word -- verifies that assumption isn't just asserted, it's
+    actually true end to end."""
+    captured: list[np.ndarray] = []
+
+    async def capture(frame: np.ndarray) -> None:
+        captured.append(frame)
+
+    pump = PlaybackPump(capture, lambda: None, sample_rate=24_000)
+    words = [WordTiming(f"W{i} ", start=i * 0.1, end=(i + 1) * 0.1) for i in range(6)]
+    tts = FakeTTS(words=words)
+    active_reply = ActiveReply()
+
+    async def _run():
+        await _synthesize_and_play(tts, "placeholder", pump, active_reply)
+        active_reply.paused_at = pump.pause()
+        # Simulate the pause landing mid-W4 rather than after the whole
+        # (short, instantly-submitted) segment finished.
+        pump._submitted_samples = int(0.45 * 24_000)
+        loop = asyncio.get_running_loop()
+        active_reply.escalation_handle = loop.call_later(10.0, lambda: None)
+        _disarm_escalation(active_reply, pump)
+        await asyncio.sleep(0.02)  # let the background drain task run
+
+    asyncio.run(_run())
+
+    # paused mid-W4 (index 4), rewind 2 -> keep_count 2 (W0, W1 kept).
+    assert [w.text for w in active_reply.heard_timeline] == ["W0 ", "W1 "]
