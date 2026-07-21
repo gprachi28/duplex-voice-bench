@@ -120,6 +120,41 @@ word whose modeled playback preceded the cut, matching the audio
 actually heard — not the full sentence, not an empty turn, and not
 words spoken after the interruption began.
 
+- `TurnGate` also force-fires after a **15s wall-clock deadline**
+  measured from a turn's first `SPEECH_START`, independent of the
+  existing 30s accumulated-speech-sample safety valve. Smart Turn's
+  completion probability can stay persistently low across several
+  short, fragmented speech bursts (observed live: `0.07`/`0.01`/`0.01`/
+  `0.05` across four bursts spanning 47s of wall clock) — since the
+  sample-count valve only counts actual voiced audio, fragmented bursts
+  rarely add up to 30s and the turn could otherwise hang with no reply.
+
+Verified: unit tests confirm the deadline fires despite low probability
+and low sample count, is measured from the turn's original start rather
+than reset by each resumed `begin()`, and resets correctly after a
+`Fire`. Live verification against the original hang scenario is still
+pending.
+
+- A **`/metrics` endpoint** on the FastAPI sidecar exposes
+  Prometheus-compatible p50/p95 latency per pipeline stage
+  (`end_of_turn`, `transcription`, `llm_ttft`, `sentence_buffer`,
+  `tts_first_chunk`, `ttfa`) plus a per-combination turns-processed
+  counter. The worker (and each per-room job subprocess it spawns)
+  appends one structured JSON record per completed turn to a shared
+  file (`agent/metrics.py`) — the sidecar is a separate OS process with
+  no other access to that data, so the file is the IPC. The sidecar
+  reads only newly-appended lines on each scrape and keeps a bounded
+  in-memory sliding window (most recent turns) to compute exact
+  nearest-rank percentiles — no persistence across sidecar restarts, no
+  cross-instance aggregation, matching this project's single-instance,
+  one-active-room design.
+
+Verified live: a real conversation session produced correct `/metrics`
+output — all six stage latencies and a `combination_id` reflecting the
+actual running STT/LLM/TTS models populated correctly for every turn,
+and each turn's `interrupted` flag cross-checked exactly (down to the
+millisecond) against the worker's own barge-in log lines.
+
 ## Layout
 
 ```
@@ -128,24 +163,26 @@ agent/
   audio.py              # to_16k_mono_f32 — the ingress format contract
   vad.py                # Silero VAD config + process-wide singleton
   smart_turn.py         # ring buffer, ONNX scorer, background observer
-  turn_gate.py          # utterance accumulation + Smart Turn-gated firing decision
+  turn_gate.py          # utterance accumulation + Smart Turn-gated + wall-clock-deadline firing decision
   stt.py                # STTBackend protocol + mlx-whisper implementation
   llm.py                # LLMBackend protocol + streaming Ollama implementation
   playback.py           # PlaybackPump: real-time-paced audio submission, pause/resume-with-rewind
   sentence_buffer.py    # buffers LLM tokens, flushes full sentences to TTS
   tts.py                # TTSBackend protocol + Kokoro (MLX), incl. word-level alignment
   whisper_features.py   # vendored numpy-only log-mel feature extraction
-  worker.py             # livekit-agents worker: VAD, Smart Turn, gated STT, streaming LLM, sentence-buffered TTS reply, barge-in
+  metrics.py            # TurnMetrics per-turn latency record + JSONL append sink
+  worker.py             # livekit-agents worker: VAD, Smart Turn, gated STT, streaming LLM, sentence-buffered TTS reply, barge-in, per-turn metrics
 client/
   index.html          # LiveKit Web SDK demo client
 server/
-  main.py             # FastAPI sidecar: /token, /health, GET / serves the client
+  main.py             # FastAPI sidecar: /token, /health, /metrics, GET / serves the client
+  metrics.py          # MetricsAggregator: reads the turn JSONL, renders Prometheus text
 tests/
   test_audio.py                    # 5 contract tests for the ingress function
   test_smart_turn_buffer.py        # ring buffer unit tests
   test_smart_turn_model.py         # ONNX inference against recorded fixtures
   test_smart_turn_observer.py      # background-thread scoring behaviour
-  test_turn_gate.py                # utterance accumulation + gating decision
+  test_turn_gate.py                # utterance accumulation + gating decision + wall-clock deadline
   test_turn_gate_smart_turn.py     # gate decisions against real Smart Turn scores
   test_stt_backend.py              # mlx-whisper transcription against recorded fixtures
   test_llm_backend.py              # Ollama streaming chat against a real local server
@@ -153,6 +190,10 @@ tests/
   test_tts_backend.py              # Kokoro synthesis against real inference
   test_playback.py                 # PlaybackPump framing, pause/resume rewind math, discard logging
   test_worker_dispatch.py          # history/lock bookkeeping, TTS handoff, and barge-in against fake backends
+  test_metrics.py                  # TurnMetrics delta computation + JSONL sink
+  test_server_metrics.py           # MetricsAggregator refresh/percentile/exposition-format
+  test_server_main_metrics.py      # GET /metrics wiring in the FastAPI sidecar
+  test_worker_metrics.py           # TurnMetrics capture wiring in _dispatch_gate_result/_synthesize_and_play
   fixtures/smart_turn/             # complete.wav / incomplete.wav
 design.md             # architecture spec (source of truth)
 requirements.txt      # runtime deps (livekit-agents, fastapi, etc.)
@@ -255,6 +296,12 @@ python -m agent.worker dev
 Then open **http://127.0.0.1:8000**, click **Connect**, allow mic, and
 speak. The worker transcribes your turn, sends it to the LLM, and speaks
 the streamed reply back through Kokoro TTS.
+
+Per-stage latency metrics are available at **http://127.0.0.1:8000/metrics**
+(Prometheus text format) once at least one turn has completed. Both
+processes need to agree on where the turn-metrics file lives —
+`METRICS_LOG_PATH` in `.env` (defaults to `/tmp/voice-agent-metrics.jsonl`
+if unset, so this works with no config).
 
 ## Run the tests
 
