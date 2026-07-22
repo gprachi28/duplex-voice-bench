@@ -34,9 +34,18 @@ class MlxWhisperBackend:
         # mlx_whisper.transcribe() runs a full extra encoder pass to guess
         # the language before transcribing -- confirmed via direct-call
         # benchmark to cost ~0.56s per turn, roughly half of measured STT
-        # latency. See benchmarks/experiments.md.
+        # latency.
+        #
+        # temperature=0.0: mlx_whisper's default is a 6-value fallback tuple
+        # that reruns the full decode at higher temperatures whenever
+        # compression_ratio_threshold ("too repetitive") or logprob_threshold
+        # fails. is_repetition_loop() below already discards repetitive
+        # output regardless of which temperature produced it, so the
+        # fallback buys nothing on its primary trigger while costing up to
+        # ~6x a single decode pass (confirmed via direct-call benchmark:
+        # 4.04s vs 0.64s). See benchmarks/experiments.md.
         result = mlx_whisper.transcribe(
-            audio, path_or_hf_repo=self._model, language="en"
+            audio, path_or_hf_repo=self._model, language="en", temperature=0.0
         )
         return result["text"].strip()
 

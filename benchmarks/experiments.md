@@ -62,6 +62,53 @@ follow-up rather than bundled into this fix.
 
 ---
 
+## 2026-07-22 -- STT temperature fallback: up to 6x decode cost on its own primary trigger
+
+- **symptom**: follow-up on the previous entry's flagged lead. The
+  `local-lv3-ollama3b-kokoro` baseline (`benchmarks/logbook.md`) showed
+  `transcription_s` p99=10.27s against a p50 of 1.28-1.33s -- a tail far
+  wider than encoder cost alone explains.
+- **root cause**: `mlx_whisper/transcribe.py:207-244`'s `decode_with_fallback`
+  reruns the full decode at each of `temperature=(0.0, 0.2, 0.4, 0.6, 0.8,
+  1.0)` in turn until `compression_ratio_threshold` (>2.4, flags "too
+  repetitive") and `logprob_threshold` (<-1.0) both pass. Could not
+  reproduce the trigger with synthetic audio -- tried 10 distortions
+  (ultra-short clips down to 0.05s, clipping/gain distortion, reversed
+  audio, self-overlap/echo, near-silence noise, a 6x-stuttered chunk, a
+  sine tone, periodic clicks, and the `incomplete.wav` fixture) and every
+  one resolved cleanly at `temperature=0.0` (compression ratios 0.27-0.90,
+  well under the 2.4 threshold) -- the pipeline also never persists raw
+  turn audio to disk, so the actual audio from the live "should should
+  should..." (~100 repeats) incident that motivated `is_repetition_loop()`
+  no longer exists to replay directly. Isolated the fallback's *cost*
+  instead, since compression-ratio failure (which that live incident is an
+  unambiguous instance of) is exactly what `compression_ratio_threshold`
+  exists to catch: forced `compression_ratio_threshold=0.0` (guaranteed
+  fallback through all 6 temperatures) against `complete.wav` and measured
+  4.04s vs. 0.64s for the normal single-pass case -- a 6.3x multiplier,
+  landing in the same range as the observed p99 outliers.
+- **fix**: `agent/stt.py` now passes `temperature=0.0` (single value, not
+  the fallback tuple) to `mlx_whisper.transcribe()`. `is_repetition_loop()`
+  already discards repetitive output regardless of which temperature
+  produced it, so the fallback's main trigger buys this pipeline nothing;
+  removing it bounds worst-case decode cost to one pass instead of six.
+  **Known tradeoff**: this also removes Whisper's ability to retry a
+  genuinely low-confidence (not repetitive) decode at a different
+  temperature -- there's no data yet on whether that recovery path was
+  ever hit productively in this pipeline, so this is a latency-for-possible-
+  quality trade, not a free win.
+- **verification**: `tests/test_stt_temperature.py` (mocked, asserts
+  `temperature=0.0` is passed) written first and confirmed failing before
+  the fix. Full suite: 160/160 passing.
+  **Still pending**: live re-run to confirm the p99 tail actually
+  shrinks (the forced-threshold measurement proves the mechanism's cost,
+  not that this exact mechanism caused every observed outlier), and a WER
+  check to see whether the lost fallback recovery is ever missed in
+  practice.
+- **status**: fixed (pending live confirmation)
+
+---
+
 ## 2026-07-22 -- Prewarm regression: worker silently killed by livekit-agents' init timeout
 
 - **symptom**: After a network blip forced a worker restart, the new
