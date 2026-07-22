@@ -51,3 +51,9 @@ build/
 
 
 models/
+
+# Bulk external corpora (e.g. LibriSpeech slices) -- the curated
+# benchmarks/datasets/audio/ set is small and committed; anything pulled
+# in wholesale from an external corpus goes here instead.
+benchmarks/datasets/bulk/*
+!benchmarks/datasets/bulk/.gitkeep
