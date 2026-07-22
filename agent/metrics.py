@@ -32,6 +32,8 @@ class TurnMetrics:
     forced: bool = False
     interrupted: bool = False
     smart_turn_prob: float | None = None
+    prompt_version: str | None = None
+    stt_repetition_detected: bool = False
 
     def to_record(self) -> dict:
         return {
@@ -39,6 +41,8 @@ class TurnMetrics:
             "turn_id": self.turn_id,
             "room": self.room,
             "combination_id": self.combination_id,
+            "prompt_version": self.prompt_version,
+            "stt_repetition_detected": self.stt_repetition_detected,
             "end_of_turn_s": _delta(self.t0, self.t1),
             "transcription_s": _delta(self.t1, self.t2),
             "llm_ttft_s": _delta(self.t2, self.t3),

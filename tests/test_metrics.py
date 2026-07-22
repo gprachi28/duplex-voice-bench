@@ -51,6 +51,30 @@ def test_to_record_includes_identifying_fields_and_flags():
     assert record["smart_turn_prob"] == 0.95
 
 
+def test_to_record_includes_prompt_version():
+    m = TurnMetrics(
+        turn_id="t", room="r", combination_id="c", prompt_version="v1-concise-en"
+    )
+    assert m.to_record()["prompt_version"] == "v1-concise-en"
+
+
+def test_to_record_prompt_version_defaults_to_none():
+    m = TurnMetrics(turn_id="t", room="r", combination_id="c")
+    assert m.to_record()["prompt_version"] is None
+
+
+def test_to_record_includes_stt_repetition_detected():
+    m = TurnMetrics(
+        turn_id="t", room="r", combination_id="c", stt_repetition_detected=True
+    )
+    assert m.to_record()["stt_repetition_detected"] is True
+
+
+def test_to_record_stt_repetition_detected_defaults_to_false():
+    m = TurnMetrics(turn_id="t", room="r", combination_id="c")
+    assert m.to_record()["stt_repetition_detected"] is False
+
+
 def test_to_record_is_null_for_deltas_missing_a_timestamp():
     # An interrupted turn never reaches later stages -- those timestamps
     # stay None, so the deltas that need them must be None too, not a

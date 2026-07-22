@@ -33,6 +33,26 @@ class MlxWhisperBackend:
         return result["text"].strip()
 
 
+def is_repetition_loop(text: str, min_repeats: int = 5) -> bool:
+    """True if `text` contains the same word repeated `min_repeats`+ times
+    consecutively -- Whisper's known decoder-repetition-loop failure mode.
+    Confirmed live: 'should' repeated ~100 times, and separately 12 times,
+    both during barge-in on already-playing TTS audio (see
+    benchmarks/experiments.md). A real utterance essentially never repeats
+    one word this many times in a row, so this is a cheap, reliable filter
+    regardless of what actually triggers the loop."""
+    words = [w.strip(".,!?;:").lower() for w in text.split()]
+    run = 1
+    for i in range(1, len(words)):
+        if words[i] and words[i] == words[i - 1]:
+            run += 1
+            if run >= min_repeats:
+                return True
+        else:
+            run = 1
+    return False
+
+
 _backend_instance: MlxWhisperBackend | None = None
 
 
