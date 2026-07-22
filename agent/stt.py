@@ -29,7 +29,15 @@ class MlxWhisperBackend:
         self._model = model
 
     def transcribe(self, audio: np.ndarray) -> str:
-        result = mlx_whisper.transcribe(audio, path_or_hf_repo=self._model)
+        # language="en": this pipeline is English-only (SYSTEM_PROMPT
+        # enforces English replies, Kokoro TTS is English-only). Without it,
+        # mlx_whisper.transcribe() runs a full extra encoder pass to guess
+        # the language before transcribing -- confirmed via direct-call
+        # benchmark to cost ~0.56s per turn, roughly half of measured STT
+        # latency. See benchmarks/experiments.md.
+        result = mlx_whisper.transcribe(
+            audio, path_or_hf_repo=self._model, language="en"
+        )
         return result["text"].strip()
 
 

@@ -20,6 +20,48 @@ Entry template:
 
 ---
 
+## 2026-07-22 -- STT transcription latency ~2x higher than necessary: language auto-detection on every call
+
+- **symptom**: `benchmarks/logbook.md`'s first baseline capture showed
+  `transcription_s` p50=1.28-1.33s for `mlx-whisper large-v3` -- 6-16x
+  design.md's projected 80-200ms.
+- **root cause**: `agent/stt.py`'s `MlxWhisperBackend.transcribe()` called
+  `mlx_whisper.transcribe(audio, path_or_hf_repo=self._model)` with no
+  `language` argument. Reading `mlx_whisper/transcribe.py:162-176`: when
+  `language` is `None`, it calls `model.detect_language()` first, which
+  (`mlx_whisper/decoding.py:53`) runs a full extra encoder forward pass over
+  the 30s-padded mel spectrogram purely to guess the language -- discarded
+  immediately, then the real transcription encoder pass runs again from
+  scratch. This pipeline is English-only regardless (`SYSTEM_PROMPT`
+  mandates English replies, Kokoro TTS is English-only), so the detection
+  was always redundant.
+- **fix**: `agent/stt.py` now passes `language="en"` explicitly, skipping
+  `detect_language()` entirely.
+- **verification**: Direct-call benchmark against the real `large-v3` model
+  (same input audio, only the `language` kwarg varied): 1.151s -> 0.589s,
+  a ~49% reduction, matching the cost of one full encoder pass almost
+  exactly. Confirmed again against `tests/fixtures/smart_turn/complete.wav`:
+  0.637s steady-state (down from the 1.28-1.33s baseline). New test
+  `tests/test_stt_language.py` (mocked, asserts `language="en"` is passed)
+  written first and confirmed failing before the fix. Full suite:
+  159/159 passing.
+  **Still pending**: a live re-run to confirm the improvement holds
+  end-to-end (through LiveKit, not just direct-call) and to re-measure
+  `ttfa_s` p50/p95 against the `local-lv3-ollama3b-kokoro` baseline.
+- **status**: fixed (pending live confirmation)
+
+A second, lower-confidence lead was noted but not yet acted on:
+`mlx_whisper.transcribe()`'s default `temperature=(0.0, 0.2, 0.4, 0.6, 0.8,
+1.0)` fallback reruns the full decode up to 6x if `compression_ratio_threshold`
+(flags "too repetitive") or `logprob_threshold` fails -- plausibly the cause
+of the 8-11s p99 TTFA outliers in the baseline run, and likely redundant
+given `is_repetition_loop()` already discards repetitive output regardless
+of which temperature produced it. Not yet empirically reproduced (no repro
+audio that reliably triggers a repetition loop); tracked as a separate
+follow-up rather than bundled into this fix.
+
+---
+
 ## 2026-07-22 -- Prewarm regression: worker silently killed by livekit-agents' init timeout
 
 - **symptom**: After a network blip forced a worker restart, the new
