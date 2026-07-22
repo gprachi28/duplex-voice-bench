@@ -18,6 +18,16 @@ Entry template:
 
 ---
 
+## 2026-07-22 -- local-lv3-ollama3b-kokoro -- live confirmation of the STT latency fixes
+- combination_id: mlx-community/whisper-large-v3-mlx|llama3.2:3b|prince-canuma/Kokoro-82M
+- run file: results/runs/20260722_223140_local-lv3-ollama3b-kokoro.jsonl (11 turns)
+- change under test: `language="en"` (skip auto-detect's extra encoder pass) and `temperature=0.0` (drop the 6-way fallback), both landed in agent/stt.py since the previous entry -- see benchmarks/experiments.md for root cause/verification of each. This is the first live session run after both fixes.
+- result: compared directly against the previous entry's run file (both share `combination_id` + `prompt_version`, so `eval_latency.py`'s grouping pools them into one blended n=25 summary -- not used here; computed pre/post separately instead):
+  - transcription p50: 1.284s -> **0.766s** (-40%); p95: 1.443s -> 1.104s (-23%)
+  - ttfa p50: 2.018s -> **1.386s** (-31%); p95: 3.420s -> 2.297s (-33%)
+- reading: Both fixes hold up live, not just in direct-call benchmarks -- STT is still the largest single stage but dropped from ~63% to ~55% of the p50 TTFA budget. No `stt_repetition_detected` flags and no outliers this session (max transcription_s 1.10s, inside the old p50-p95 band) -- consistent with the temperature-fallback fix, though n=11 is too small to credit that fix specifically for tail suppression versus just not hitting a repetition case this session. p50 TTFA (1.386s) is still ~1.4x the <1s target.
+- next: `eval_latency.py`/`plot.py` currently have no way to keep a before/after pair like this from silently blending once grouped by `(combination_id, prompt_version)` -- pooling multiple fix-iteration sessions defeats the point of measuring whether a change helped. Needs a visualization/tracking redesign before the next fix lands (see experiments.md for the design discussion).
+
 ## 2026-07-22 -- local-lv3-ollama3b-kokoro -- first baseline capture from live dev sessions
 - combination_id: mlx-community/whisper-large-v3-mlx|llama3.2:3b|prince-canuma/Kokoro-82M
 - run file: results/runs/20260722_214718_local-lv3-ollama3b-kokoro.jsonl (14 turns)
