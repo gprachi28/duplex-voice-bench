@@ -9,6 +9,7 @@
     button { padding: 0.5rem 1rem; margin-right: 0.5rem; font-size: 1rem; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #status { margin-top: 1rem; padding: 0.5rem 0.75rem; background: #f0f0f0; border-radius: 4px; }
+    #turnState { display: none; margin-top: 0.5rem; padding: 0.5rem 0.75rem; background: #fff3cd; border: 1px solid #ffe69c; border-radius: 4px; }
     #log { margin-top: 1rem; padding: 0.5rem 0.75rem; background: #111; color: #0f0; font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; min-height: 6rem; border-radius: 4px; }
   </style>
 </head>
@@ -18,6 +19,7 @@
   <button id="connectBtn">Connect</button>
   <button id="disconnectBtn" disabled>Disconnect</button>
   <div id="status">idle</div>
+  <div id="turnState">🎤 Still listening — take your time…</div>
   <div id="audioSink"></div>
   <div id="log"></div>
 
@@ -27,6 +29,7 @@
     const ROOM = "echo-test";
     const $status = document.getElementById("status");
     const $log = document.getElementById("log");
+    const $turnState = document.getElementById("turnState");
     const $audio = document.getElementById("audioSink");
     const $connect = document.getElementById("connectBtn");
     const $disconnect = document.getElementById("disconnectBtn");
@@ -70,6 +73,18 @@
         room.on(RoomEvent.ConnectionStateChanged, (state) => {
           log(`connection state: ${state}`);
         });
+        // Worker publishes {"state": "listening" | "idle"} on the
+        // "turn_state" topic so a long pause reads as "still listening"
+        // instead of dead air -- see design.md's Known Issues.
+        room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+          if (topic !== "turn_state") return;
+          try {
+            const { state } = JSON.parse(new TextDecoder().decode(payload));
+            $turnState.style.display = state === "listening" ? "block" : "none";
+          } catch (err) {
+            log(`turn_state parse error: ${err.message || err}`);
+          }
+        });
 
         await room.connect(url, token);
         log(`joined room "${ROOM}" as ${identity}`);
@@ -95,6 +110,7 @@
         room = null;
       }
       $audio.replaceChildren();
+      $turnState.style.display = "none";
       $connect.disabled = false;
       $status.textContent = "idle";
     }

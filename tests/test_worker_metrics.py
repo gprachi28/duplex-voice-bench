@@ -13,7 +13,12 @@ import agent.worker as worker_module
 from agent.playback import PlaybackState
 from agent.tts import TTSResult, WordTiming
 from agent.turn_gate import Fire, ForceFire
-from agent.worker import ActiveReply, _dispatch_gate_result, _synthesize_and_play
+from agent.worker import (
+    FALLBACK_REPLY,
+    ActiveReply,
+    _dispatch_gate_result,
+    _synthesize_and_play,
+)
 
 
 class FakeSTT:
@@ -98,6 +103,38 @@ def test_dispatch_with_t0_writes_one_metrics_record(metrics_path):
     assert record["smart_turn_prob"] == 0.95
     assert record["end_of_turn_s"] is not None  # t1 - t0, both stages reached
     assert record["ttfa_s"] is not None  # t5 - t0, TTS actually ran
+    assert record["prompt_version"] == worker_module.SYSTEM_PROMPT_VERSION
+
+
+def test_dispatch_on_stt_repetition_loop_skips_llm_and_speaks_fallback(metrics_path):
+    class ExplodingLLM:
+        async def stream_chat(self, messages):
+            raise AssertionError("LLM must not be called on a repetition-loop transcript")
+            yield  # pragma: no cover -- makes this an async generator
+
+    pump = FakePump()
+    history: list[dict[str, str]] = []
+    asyncio.run(
+        _dispatch_gate_result(
+            Fire(np.zeros(1, dtype=np.float32)),
+            FakeSTT(" ".join(["should"] * 50)),
+            ExplodingLLM(),
+            FakeTTS(),
+            history,
+            asyncio.Lock(),
+            ActiveReply(room="room-1"),
+            pump,
+            t0=100.0,
+            smart_turn_prob=0.95,
+        )
+    )
+
+    assert history == []  # neither the garbage transcript nor a fallback reply
+    assert len(pump.submitted) == 1  # the fallback was spoken via the normal TTS path
+
+    record = _read_records(metrics_path)[0]
+    assert record["stt_repetition_detected"] is True
+    assert record["llm_ttft_s"] is None  # LLM stage never reached
 
 
 def test_dispatch_without_t0_writes_no_metrics_record(metrics_path):

@@ -17,6 +17,7 @@ mid-capture_frame()).
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -27,13 +28,13 @@ from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents.vad import VADEventType
 
-from agent.audio import to_16k_mono_f32
+from agent.audio import TARGET_SR, to_16k_mono_f32
 from agent.llm import OLLAMA_MODEL, LLMBackend, create_llm_backend
 from agent.metrics import DEFAULT_METRICS_LOG_PATH, TurnMetrics, append_turn_metrics
 from agent.playback import PlaybackPump, PlaybackState
 from agent.sentence_buffer import SentenceBuffer
 from agent.smart_turn import SmartTurnObserver, create_smart_turn_scorer
-from agent.stt import WHISPER_MODEL, STTBackend, create_stt_backend
+from agent.stt import WHISPER_MODEL, STTBackend, create_stt_backend, is_repetition_loop
 from agent.tts import KOKORO_REPO, TTSBackend, create_tts_backend
 from agent.turn_gate import Continue, ForceFire, GateResult, TurnGate, create_turn_gate
 from agent.vad import create_vad
@@ -43,6 +44,37 @@ METRICS_LOG_PATH = os.environ.get("METRICS_LOG_PATH", DEFAULT_METRICS_LOG_PATH)
 # reflects the one hardcoded combination. See design.md's "Benchmark
 # Combinations" table for where this is headed.
 COMBINATION_ID = f"{WHISPER_MODEL}|{OLLAMA_MODEL}|{KOKORO_REPO}"
+
+# Spoken when STT output is a detected repetition loop (see
+# agent/stt.py's is_repetition_loop) -- design.md's "Error recovery"
+# section already specifies this exact fallback for stage failures; this
+# is the first path that actually speaks it rather than silently
+# returning. The garbage transcript never reaches the LLM or history.
+FALLBACK_REPLY = "Sorry, I didn't catch that."
+
+# Bump whenever SYSTEM_PROMPT's text changes and add an entry to
+# benchmarks/prompts.md -- this travels into every turn's metrics record
+# (see TurnMetrics.prompt_version) so benchmark results stay traceable to
+# the exact prompt text that produced them, not just the STT/LLM/TTS
+# combination_id.
+SYSTEM_PROMPT_VERSION = "v1-concise-en"
+
+# Without this, llama3.2:3b defaults to long replies and, on at least one
+# live turn, drifted into Hindi -- transcripts confirmed the LLM itself
+# produced the Hindi text, and Kokoro (English-only TTS) rendered it as
+# garbage audio. See benchmarks/experiments.md.
+SYSTEM_PROMPT = (
+    "You are a helpful voice assistant. Your replies are spoken aloud, so "
+    "keep them short and conversational -- one to three sentences unless "
+    "the user explicitly asks for more detail, a list, or a recipe/steps. "
+    "Always reply in English, even if a question references another "
+    "language or asks about earlier turns in the conversation."
+)
+
+
+def _new_history() -> list[dict[str, str]]:
+    """A fresh per-room conversation history, seeded with SYSTEM_PROMPT."""
+    return [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
 @dataclass
@@ -214,7 +246,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     llm_backend = create_llm_backend()
     # Session-scoped, NOT a singleton like the backends above -- a fresh
     # list/lock/reply-tracker per room job, or state would leak across rooms.
-    history: list[dict[str, str]] = []
+    history: list[dict[str, str]] = _new_history()
     history_lock = asyncio.Lock()
     active_reply = ActiveReply(room=room_name)
 
@@ -231,6 +263,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             history_lock,
             active_reply,
             pump,
+            ctx.room.local_participant,
         )
     )
     ingest_task = asyncio.create_task(
@@ -246,6 +279,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             history_lock,
             active_reply,
             pump,
+            ctx.room.local_participant,
         )
     )
     left_task = asyncio.create_task(user_left.wait())
@@ -285,6 +319,7 @@ async def _ingest(
     history_lock: asyncio.Lock,
     active_reply: ActiveReply,
     pump: PlaybackPump,
+    local_participant: rtc.LocalParticipant,
 ) -> None:
     """Read frames, normalise, and mirror into the VAD stream, the Smart
     Turn ring buffer, and the turn gate's utterance buffer."""
@@ -300,8 +335,13 @@ async def _ingest(
         if turn_gate.push(mono_16k):
             # Max utterance duration crossed — force-fire without waiting
             # for a Silero END_OF_SPEECH a long monologue might never produce.
+            # Always a ForceFire (never Continue), so the "listening"
+            # indicator always clears here -- see _consume_vad_events'
+            # docstring on why turn_gate.is_open (not a local flag) is the
+            # single source of truth shared across this and that function.
             prob = turn_observer.latest_probability
             result = turn_gate.evaluate(prob)
+            asyncio.create_task(_publish_turn_state(local_participant, "idle"))
             asyncio.create_task(
                 _dispatch_gate_result(
                     result,
@@ -335,6 +375,29 @@ async def _ingest(
             frame_count, last_log = 0, now
 
 
+async def _publish_turn_state(local_participant: rtc.LocalParticipant, state: str) -> None:
+    """Tells the client's visual indicator whether a turn is open -- see
+    design.md's Known Issues: "No feedback during a long pause" (a real
+    hesitation and a stuck turn were indistinguishable to the user, who
+    repeated themselves live). Callers should wrap this in
+    asyncio.create_task rather than awaiting inline, so a slow/stalled
+    data-channel publish can never delay turn dispatch."""
+    await local_participant.publish_data(
+        json.dumps({"state": state}), reliable=True, topic="turn_state"
+    )
+
+
+def _speech_duration_since(started_at: float | None, now: float) -> float:
+    """Wall-clock seconds since START_OF_SPEECH, used for the SPEECH_END log
+    line instead of the VAD event's own speech_duration field -- confirmed
+    that field is hardcoded to 0.0 on every END_OF_SPEECH event by the
+    installed livekit-plugins-silero (it zeroes pub_speech_duration right
+    before constructing the event), which made a real incident (a turn
+    stuck fragmented across a long gap) much harder to diagnose from logs
+    than it should have been. See benchmarks/experiments.md."""
+    return now - started_at if started_at is not None else 0.0
+
+
 async def _consume_vad_events(
     vad_stream,
     turn_observer: SmartTurnObserver,
@@ -346,6 +409,7 @@ async def _consume_vad_events(
     history_lock: asyncio.Lock,
     active_reply: ActiveReply,
     pump: PlaybackPump,
+    local_participant: rtc.LocalParticipant,
 ) -> None:
     """Log Silero VAD speech-boundary events, consulting the Smart Turn
     completion probability at END_OF_SPEECH to decide — via TurnGate —
@@ -357,13 +421,27 @@ async def _consume_vad_events(
     utterance doesn't have to wait for Smart Turn to confirm it's a
     complete turn before the agent goes quiet; SPEECH_END disarms it --
     resuming (with a rewind) if speech turned out to be brief, since Smart
-    Turn's own Fire/Continue evaluation below can now run normally."""
+    Turn's own Fire/Continue evaluation below can now run normally.
+
+    Also publishes a "listening"/"idle" turn-state to the client over the
+    data channel, driven by turn_gate.is_open (the single source of truth
+    -- _ingest's own sample-count ForceFire path can also resolve the same
+    turn, so this can't be a local flag duplicated in both places): "on"
+    the moment a turn opens, "off" once it resolves via Fire/ForceFire.
+    This deliberately spans the silent gaps between speech bursts within
+    one open turn, since that's exactly where a real pause and a stuck
+    turn looked identical to the user (see design.md's Known Issues)."""
     logger.info("VAD event task started")
     first_inference_logged = False
+    speech_started_at: float | None = None
     async for event in vad_stream:
         if event.type == VADEventType.START_OF_SPEECH:
+            speech_started_at = time.monotonic()
             logger.info("SPEECH_START (prob=%.2f)", event.probability)
+            was_open = turn_gate.is_open
             turn_gate.begin()
+            if not was_open:
+                asyncio.create_task(_publish_turn_state(local_participant, "listening"))
             _arm_escalation(active_reply, pump)
         elif event.type == VADEventType.END_OF_SPEECH:
             _disarm_escalation(active_reply, pump)
@@ -371,10 +449,12 @@ async def _consume_vad_events(
             t0 = time.monotonic()
             logger.info(
                 "SPEECH_END (duration=%.2fs) smart_turn_prob=%.2f",
-                event.speech_duration,
+                _speech_duration_since(speech_started_at, t0),
                 prob,
             )
             result = turn_gate.evaluate(prob)
+            if not isinstance(result, Continue):
+                asyncio.create_task(_publish_turn_state(local_participant, "idle"))
             asyncio.create_task(
                 _dispatch_gate_result(
                     result,
@@ -668,6 +748,7 @@ async def _dispatch_gate_result(
         t0=t0,
         forced=forced,
         smart_turn_prob=smart_turn_prob,
+        prompt_version=SYSTEM_PROMPT_VERSION,
     )
     try:
         if forced:
@@ -680,6 +761,17 @@ async def _dispatch_gate_result(
             return
         metrics.t2 = time.monotonic()
         logger.info("TRANSCRIPT (%s): %r", "forced" if forced else "confirmed", text)
+
+        if is_repetition_loop(text):
+            metrics.stt_repetition_detected = True
+            logger.warning(
+                "STT repetition-loop detected (turn_id=%s): %r -- skipping LLM, "
+                "speaking fallback reply",
+                metrics.turn_id,
+                text,
+            )
+            await _synthesize_and_play(tts_backend, FALLBACK_REPLY, pump, active_reply, metrics)
+            return
 
         async with history_lock:
             history.append({"role": "user", "content": text})
@@ -727,19 +819,44 @@ async def _dispatch_gate_result(
             append_turn_metrics(METRICS_LOG_PATH, metrics)
 
 
+async def _warm_llm(llm_backend: LLMBackend) -> None:
+    """One throwaway round-trip so Ollama loads the model into memory here
+    instead of on the first live turn -- see _prewarm's docstring."""
+    async for _ in llm_backend.stream_chat([{"role": "user", "content": "Hi"}]):
+        pass
+
+
 def _prewarm(proc: agents.JobProcess) -> None:
     """Runs in each subprocess before entrypoint so Silero, Smart Turn, STT,
     LLM, and TTS backends are already loaded/constructed.
 
-    TTS also gets one dummy synthesis call here: MLX lazily compiles
-    Kokoro's graph on the first real call (~2-3s cold vs. ~0.1-0.2s once
-    warm, measured), and prewarm exists precisely so that cost lands here
-    rather than mid-reply in a live conversation.
+    STT and TTS each get one dummy inference call here, and the LLM one
+    dummy round-trip: mlx-whisper doesn't load/compile its weights until
+    the first real transcribe() call, Ollama doesn't load its model into
+    memory until the first real /api/chat, and MLX lazily compiles
+    Kokoro's graph on its first real call (~2-3s cold vs. ~0.1-0.2s once
+    warm, measured). Without this, the first real utterance of a session
+    pays all of that cost at once -- confirmed live as the direct cause of
+    a too-short first utterance (see turn_gate.py's MIN_UTTERANCE_S) also
+    landing on a cold STT call and hallucinating (benchmarks/experiments.md).
+    Measured: _prewarm now takes ~6.8s total (was ~0s for STT/LLM before
+    this fix); a real STT/LLM call immediately after is back to normal
+    steady-state latency (~1.3s / ~0.2s) instead of paying a multi-second
+    model-load spike on the first live turn.
+
+    The LLM warmup is wrapped in try/except: unlike STT/TTS (purely local,
+    already-cached weights), it depends on Ollama actually running, which
+    README.md documents as best-effort -- the worker must still start
+    (and just pay the cold-load cost on the first real turn) if it isn't.
     """
     create_vad()
     create_smart_turn_scorer()
-    create_stt_backend()
-    create_llm_backend()
+    create_stt_backend().transcribe(np.zeros(TARGET_SR, dtype=np.float32))
+    llm_backend = create_llm_backend()
+    try:
+        asyncio.run(_warm_llm(llm_backend))
+    except Exception:
+        logger.warning("LLM warmup failed (is Ollama running?) -- continuing")
     create_tts_backend().synthesize("Ready.")
     logger.info(
         "Silero VAD + Smart Turn + STT + LLM + TTS preloaded (pid=%d)",
@@ -749,5 +866,15 @@ def _prewarm(proc: agents.JobProcess) -> None:
 
 if __name__ == "__main__":
     agents.cli.run_app(
-        agents.WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=_prewarm)
+        agents.WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=_prewarm,
+            # Default is 10.0s. _prewarm now does a real STT transcribe, an
+            # LLM round-trip, and Kokoro's graph compile, back to back --
+            # confirmed live: livekit-agents killed the process with
+            # "initialization timed out" before prewarm could finish,
+            # silently (no worker ever registers, nothing ever logs).
+            # See benchmarks/experiments.md.
+            initialize_process_timeout=60.0,
+        )
     )

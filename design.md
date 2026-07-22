@@ -352,6 +352,7 @@ prompt, different backend, audibly different result.
 | Cohere Transcribe SDK maturity | Unstable API surface | Abstract behind interface; easy to swap |
 | Sentence buffer adds latency | First TTS flush delayed | Tune minimum flush size; measure tradeoff |
 | Smart Turn false positives | Premature cutoff | Expose confidence threshold as config; benchmark against silence baseline |
+| No feedback during a long pause (`MAX_TURN_WALL_CLOCK_S`) | A real hesitation and a stuck/broken turn are indistinguishable to the user, who may repeat themselves — confirmed live, see benchmarks/experiments.md | Client-side visual indicator (`client/index.html`'s `#turnState` banner, driven by `TurnGate.is_open` over the data channel) — pending live confirmation |
 | LiveKit Cloud free tier limits | Live demos unavailable if exhausted | 5000 conn-min/month is >20h of talk time; videos are the primary artifact, so exhaustion only blocks credentialed live sessions |
 | Agent worker down = live demo down | Local M4 must be running for live access | Worker connects out to LiveKit Cloud; no inbound port needed. Video demos unaffected |
 | No public deploy = cannot try before asking | Recruiter friction | Video demos front the README; live access is a one-email ask |
