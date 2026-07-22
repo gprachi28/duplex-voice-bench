@@ -19,6 +19,15 @@ from agent.audio import TARGET_SR
 GATE_THRESHOLD = 0.5
 MAX_UTTERANCE_S = 30.0
 MAX_TURN_WALL_CLOCK_S = 15.0
+# Below this, Whisper hallucinates canned phrases on the near-empty clip
+# instead of returning nothing -- confirmed live: a 0.5s first-utterance
+# segment scored smart_turn_prob=0.75 and fired straight into STT, which
+# produced "Sous-titrage Société Radio-Canada" (Whisper's well-known
+# near-silence hallucination). 0.3s matches Silero's own trailing-silence
+# window (design.md). Only gates the probability-based Fire below -- the
+# ForceFire safety valves exist to prevent hangs, not to judge signal
+# quality, so they're untouched.
+MIN_UTTERANCE_S = 0.3
 
 
 @dataclass(frozen=True)
@@ -55,17 +64,28 @@ class TurnGate:
         max_duration_s: float = MAX_UTTERANCE_S,
         sample_rate: int = TARGET_SR,
         max_wall_clock_s: float = MAX_TURN_WALL_CLOCK_S,
+        min_duration_s: float = MIN_UTTERANCE_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._threshold = threshold
         self._max_samples = int(max_duration_s * sample_rate)
         self._max_wall_clock_s = max_wall_clock_s
+        self._min_samples = int(min_duration_s * sample_rate)
         self._clock = clock
         self._chunks: list[np.ndarray] = []
         self._total_samples = 0
         self._open = False
         self._over_budget = False
         self._turn_started_at: float | None = None
+
+    @property
+    def is_open(self) -> bool:
+        """True from the first begin() of a turn until it resolves via
+        Fire/ForceFire (_clear()) -- spans Continue's silent gaps too, since
+        the turn is still pending resolution throughout. Used to drive the
+        client's "listening" visual indicator (see design.md's Known
+        Issues: "No feedback during a long pause")."""
+        return self._turn_started_at is not None
 
     def begin(self) -> None:
         self._open = True
@@ -92,7 +112,7 @@ class TurnGate:
         if started_at is not None and self._clock() - started_at >= self._max_wall_clock_s:
             self._clear()
             return ForceFire(audio)
-        if smart_turn_prob >= self._threshold:
+        if smart_turn_prob >= self._threshold and self._total_samples >= self._min_samples:
             self._clear()
             return Fire(audio)
         self._open = False

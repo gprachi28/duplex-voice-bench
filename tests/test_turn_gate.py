@@ -33,9 +33,9 @@ def test_fire_on_high_probability_returns_pushed_audio_and_clears_buffer(gate):
 
     # Buffer cleared: a subsequent turn only contains what's pushed after this point.
     gate.begin()
-    gate.push(np.array([9.0], dtype=np.float32))
+    gate.push(np.array([9.0, 9.0, 9.0], dtype=np.float32))
     result2 = gate.evaluate(0.9)
-    assert np.array_equal(result2.audio, np.array([9.0], dtype=np.float32))
+    assert np.array_equal(result2.audio, np.array([9.0, 9.0, 9.0], dtype=np.float32))
 
 
 def test_continue_on_low_probability_keeps_buffer(gate):
@@ -61,9 +61,10 @@ def test_resumed_turn_stitches_onto_retained_buffer(gate):
 def test_push_before_begin_is_a_noop(gate):
     assert gate.push(np.array([1.0, 2.0, 3.0], dtype=np.float32)) is False
     gate.begin()
+    gate.push(np.array([9.0, 9.0, 9.0], dtype=np.float32))
     result = gate.evaluate(0.9)
     assert isinstance(result, Fire)
-    assert result.audio.shape == (0,)
+    assert np.array_equal(result.audio, np.array([9.0, 9.0, 9.0], dtype=np.float32))
 
 
 def test_push_returns_true_exactly_once_when_crossing_max_duration(gate):
@@ -81,9 +82,9 @@ def test_force_fire_after_max_duration_ignores_probability_and_clears_buffer(gat
     assert result.audio.shape == (11,)
 
     gate.begin()
-    gate.push(np.array([99.0], dtype=np.float32))
+    gate.push(np.array([99.0, 99.0, 99.0], dtype=np.float32))
     result2 = gate.evaluate(0.9)
-    assert np.array_equal(result2.audio, np.array([99.0], dtype=np.float32))
+    assert np.array_equal(result2.audio, np.array([99.0, 99.0, 99.0], dtype=np.float32))
 
 
 def test_wall_clock_deadline_force_fires_despite_low_probability_and_low_sample_count():
@@ -125,6 +126,79 @@ def test_wall_clock_deadline_is_measured_from_turn_start_not_from_each_resume():
     gate.begin()  # resume — must NOT reset the deadline to 12.0 + 15.0
     clock.now = 15.1  # 15.1s since the ORIGINAL start, only 3.1s since resume
     assert isinstance(gate.evaluate(0.01), ForceFire)
+
+
+def test_is_open_false_before_any_begin(gate):
+    assert gate.is_open is False
+
+
+def test_is_open_true_after_begin_and_stays_true_across_a_continue(gate):
+    gate.begin()
+    assert gate.is_open is True
+    gate.push(np.array([1.0], dtype=np.float32))
+    gate.evaluate(0.1)  # Continue
+    assert gate.is_open is True  # still pending -- a real pause, not resolved
+
+
+def test_is_open_false_after_a_fire(gate):
+    gate.begin()
+    gate.push(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+    gate.evaluate(0.9)  # Fire
+    assert gate.is_open is False
+
+
+def test_is_open_false_after_a_force_fire(gate):
+    gate.begin()
+    gate.push(np.zeros(11, dtype=np.float32))  # over budget
+    gate.evaluate(0.01)  # ForceFire
+    assert gate.is_open is False
+
+
+def test_fire_is_suppressed_when_accumulated_audio_is_below_minimum_duration(gate):
+    # gate fixture: sample_rate=10, default min_duration_s=0.3s -> 3-sample floor.
+    gate.begin()
+    gate.push(np.array([1.0, 2.0], dtype=np.float32))  # 2 samples, under the floor
+    result = gate.evaluate(0.99)  # high probability, but not enough audio yet
+    assert isinstance(result, Continue)
+
+
+def test_fire_proceeds_once_minimum_duration_is_reached(gate):
+    gate.begin()
+    gate.push(np.array([1.0, 2.0], dtype=np.float32))
+    assert isinstance(gate.evaluate(0.99), Continue)  # still under the floor
+
+    gate.begin()  # resume -- buffer retained
+    gate.push(np.array([3.0], dtype=np.float32))  # now 3 samples -- meets the floor
+    result = gate.evaluate(0.99)
+    assert isinstance(result, Fire)
+    assert np.array_equal(result.audio, np.array([1.0, 2.0, 3.0], dtype=np.float32))
+
+
+def test_min_duration_does_not_gate_the_sample_count_force_fire():
+    # min_duration_s=5.0 -> a 50-sample floor, far above what's pushed here.
+    gate = TurnGate(threshold=0.5, max_duration_s=1.0, sample_rate=10, min_duration_s=5.0)
+    gate.begin()
+    gate.push(np.zeros(11, dtype=np.float32))  # already past the 10-sample cap
+    result = gate.evaluate(0.01)
+    assert isinstance(result, ForceFire)
+    assert result.audio.shape == (11,)
+
+
+def test_min_duration_does_not_gate_the_wall_clock_force_fire():
+    clock = FakeClock()
+    gate = TurnGate(
+        threshold=0.5,
+        max_duration_s=100.0,
+        sample_rate=10,
+        max_wall_clock_s=15.0,
+        min_duration_s=5.0,  # 50-sample floor, far above the 1 sample pushed here
+        clock=clock,
+    )
+    gate.begin()
+    gate.push(np.array([1.0], dtype=np.float32))
+    clock.now = 15.1
+    result = gate.evaluate(0.01)
+    assert isinstance(result, ForceFire)
 
 
 def test_wall_clock_deadline_resets_after_a_fire():
