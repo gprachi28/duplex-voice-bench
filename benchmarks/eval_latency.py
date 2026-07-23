@@ -27,6 +27,20 @@ STAGES = [
 ]
 
 
+def parse_change_tag(path: str) -> str:
+    """Returns the <change-tag> segment of a
+    <timestamp>_<slug>__<change-tag>.jsonl run filename. Raises ValueError
+    (naming the offending path) if the filename has no "__" separator --
+    every run file must be tagged with the code state it was captured
+    against. See
+    docs/superpowers/specs/2026-07-23-benchmark-change-tag-trends-design.md.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if "__" not in stem:
+        raise ValueError(f"run file missing __<change-tag> suffix: {path}")
+    return stem.split("__", 1)[1]
+
+
 def load_runs(runs_dir: str) -> list[dict]:
     records = []
     for path in sorted(glob.glob(os.path.join(runs_dir, "*.jsonl"))):

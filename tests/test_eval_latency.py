@@ -5,10 +5,13 @@ computes p50/p95/p99 per stage. See benchmarks/README.md.
 
 import json
 
+import pytest
+
 from benchmarks.eval_latency import (
     STAGES,
     group_by_combination,
     load_runs,
+    parse_change_tag,
     percentile,
     summarize,
 )
@@ -123,3 +126,20 @@ def test_summarize_covers_every_stage():
     summary = summarize([_record()])
 
     assert set(STAGES) <= summary.keys()
+
+
+def test_parse_change_tag_returns_segment_after_double_underscore():
+    path = "benchmarks/results/runs/20260722_223140_local-lv3-ollama3b-kokoro__stt-lang-temp.jsonl"
+
+    assert parse_change_tag(path) == "stt-lang-temp"
+
+
+def test_parse_change_tag_works_on_a_bare_filename_without_directory():
+    assert parse_change_tag("20260722_100000_combo__baseline.jsonl") == "baseline"
+
+
+def test_parse_change_tag_raises_when_no_double_underscore():
+    path = "benchmarks/results/runs/20260722_223140_local-lv3-ollama3b-kokoro.jsonl"
+
+    with pytest.raises(ValueError, match="20260722_223140_local-lv3-ollama3b-kokoro.jsonl"):
+        parse_change_tag(path)
