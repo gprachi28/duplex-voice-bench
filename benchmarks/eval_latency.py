@@ -89,18 +89,19 @@ def combo_tag_key(base: str, change_tag: str) -> str:
     return f"{base} [{change_tag}]"
 
 
-def group_by_combination(records: list[dict]) -> dict[str, list[dict]]:
-    """Groups by (combination_id, prompt_version) -- a prompt change is as
-    much a change in what's being measured as a model swap is, so pooling
-    two prompt versions under one combination_id would blur the very
-    difference this is meant to surface. Older records with no
+def group_by_combination_and_tag(
+    tagged_records: list[tuple[str, dict]]
+) -> dict[str, list[dict]]:
+    """Groups by (combination_id, prompt_version, change_tag) -- a prompt
+    change is as much a change in what's being measured as a model swap
+    is, and a change_tag marks a distinct code-state iteration against the
+    same combination+prompt, so pooling across any of the three would blur
+    the difference this is meant to surface. Older records with no
     prompt_version key are grouped under the bare combination_id."""
     grouped: dict[str, list[dict]] = defaultdict(list)
-    for record in records:
-        combo = record.get("combination_id", "unknown")
-        prompt_version = record.get("prompt_version")
-        key = f"{combo} [prompt={prompt_version}]" if prompt_version else combo
-        grouped[key].append(record)
+    for change_tag, record in tagged_records:
+        base = combo_base_key(record.get("combination_id", "unknown"), record.get("prompt_version"))
+        grouped[combo_tag_key(base, change_tag)].append(record)
     return grouped
 
 
@@ -125,7 +126,7 @@ def summarize(records: list[dict]) -> dict:
 
 
 def analyze(runs_dir: str) -> dict[str, dict]:
-    grouped = group_by_combination(load_runs(runs_dir))
+    grouped = group_by_combination_and_tag(load_runs_with_tags(runs_dir))
     return {combo: summarize(records) for combo, records in grouped.items()}
 
 

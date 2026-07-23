@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from benchmarks.eval_latency import group_by_combination, load_runs, percentile
+from benchmarks.eval_latency import group_by_combination_and_tag, load_runs_with_tags, percentile
 
 STAGE_LABELS = {
     "end_of_turn_s": "End of turn",
@@ -167,7 +167,7 @@ def main(
 ) -> None:
     with open(summary_path) as f:
         latency_summary = json.load(f)
-    grouped_records = group_by_combination(load_runs(runs_dir))
+    grouped_records = group_by_combination_and_tag(load_runs_with_tags(runs_dir))
 
     os.makedirs(plots_dir, exist_ok=True)
     plot_stage_breakdown(latency_summary, os.path.join(plots_dir, "stage_breakdown.png"))

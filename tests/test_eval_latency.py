@@ -11,7 +11,7 @@ from benchmarks.eval_latency import (
     STAGES,
     combo_base_key,
     combo_tag_key,
-    group_by_combination,
+    group_by_combination_and_tag,
     load_runs,
     load_runs_with_tags,
     parse_change_tag,
@@ -55,44 +55,61 @@ def test_load_runs_is_safe_on_an_empty_directory(tmp_path):
     assert load_runs(str(tmp_path)) == []
 
 
-def test_group_by_combination_splits_records_by_combination_id():
-    records = [
-        _record(combination_id="combo-a"),
-        _record(combination_id="combo-b"),
-        _record(combination_id="combo-a"),
+def test_group_by_combination_and_tag_splits_records_by_combination_id():
+    tagged_records = [
+        ("t1", _record(combination_id="combo-a")),
+        ("t1", _record(combination_id="combo-b")),
+        ("t1", _record(combination_id="combo-a")),
     ]
 
-    grouped = group_by_combination(records)
+    grouped = group_by_combination_and_tag(tagged_records)
 
     assert len(grouped) == 2
     sizes = sorted(len(v) for v in grouped.values())
     assert sizes == [1, 2]
 
 
-def test_group_by_combination_splits_the_same_combination_id_by_prompt_version():
+def test_group_by_combination_and_tag_splits_the_same_combination_id_by_prompt_version():
     # Same STT/LLM/TTS combination, different SYSTEM_PROMPT -- pooling these
     # would blur a prompt change's effect into the combination's numbers.
-    records = [
-        _record(combination_id="combo-a", prompt_version="v1-concise-en"),
-        _record(combination_id="combo-a", prompt_version="v2-shorter"),
-        _record(combination_id="combo-a", prompt_version="v1-concise-en"),
+    tagged_records = [
+        ("t1", _record(combination_id="combo-a", prompt_version="v1-concise-en")),
+        ("t1", _record(combination_id="combo-a", prompt_version="v2-shorter")),
+        ("t1", _record(combination_id="combo-a", prompt_version="v1-concise-en")),
     ]
 
-    grouped = group_by_combination(records)
+    grouped = group_by_combination_and_tag(tagged_records)
 
     assert len(grouped) == 2
     assert sum(len(v) for v in grouped.values()) == 3
 
 
-def test_group_by_combination_tolerates_records_with_no_prompt_version():
+def test_group_by_combination_and_tag_tolerates_records_with_no_prompt_version():
     # Older run files (recorded before prompt_version existed) shouldn't
     # crash the analyzer.
-    records = [_record(combination_id="combo-a")]
-    del records[0]["prompt_version"]
+    record = _record(combination_id="combo-a")
+    del record["prompt_version"]
 
-    grouped = group_by_combination(records)
+    grouped = group_by_combination_and_tag([("t1", record)])
 
-    assert len(grouped["combo-a"]) == 1
+    assert grouped["combo-a [t1]"] == [record]
+
+
+def test_group_by_combination_and_tag_splits_the_same_combination_by_change_tag():
+    # The exact scenario this feature fixes: two runs sharing
+    # combination_id and prompt_version but captured against different
+    # code states must not be pooled.
+    tagged_records = [
+        ("baseline", _record(combination_id="combo-a")),
+        ("stt-lang-temp", _record(combination_id="combo-a")),
+        ("baseline", _record(combination_id="combo-a")),
+    ]
+
+    grouped = group_by_combination_and_tag(tagged_records)
+
+    assert len(grouped) == 2
+    sizes = sorted(len(v) for v in grouped.values())
+    assert sizes == [1, 2]
 
 
 def test_percentile_p50_and_p95_over_a_known_distribution():
