@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from benchmarks.eval_latency import group_by_combination_and_tag, load_runs_with_tags, percentile
+from benchmarks.eval_latency import combo_tag_key, group_by_combination_and_tag, load_runs_with_tags, percentile
 
 STAGE_LABELS = {
     "end_of_turn_s": "End of turn",
@@ -148,6 +149,64 @@ def plot_ttfa_distribution(grouped_records: dict[str, list[dict]], out_path: str
 
     ax.set_xlabel("TTFA (s)", color=MUTED_INK)
     ax.set_ylabel("Turns", color=MUTED_INK)
+    ax.grid(axis="y", color=GRIDLINE, linewidth=1)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.tick_params(colors=MUTED_INK)
+    ax.legend(frameon=False, labelcolor=PRIMARY_INK)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=CHART_SURFACE)
+    plt.close(fig)
+
+
+def _single_trend_base(ordered_tags: dict[str, list[str]]) -> str | None:
+    """Returns the one (combination_id, prompt_version) base with >=2
+    change-tags, or None if none qualify. Cross-combination trend
+    comparison is out of scope (only one combination is wired today) --
+    if more than one base qualifies, warns to stderr and returns None
+    rather than guessing which to plot."""
+    candidates = [base for base, tags in ordered_tags.items() if len(tags) >= 2]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        print(
+            "trend plots: skipped, multiple combinations have >=2 change-tags "
+            f"({candidates}) -- cross-combination trend charts are out of scope",
+            file=sys.stderr,
+        )
+    return None
+
+
+def plot_ttfa_trend(
+    latency_summary: dict[str, dict],
+    ordered_tags: dict[str, list[str]],
+    out_path: str,
+) -> None:
+    base = _single_trend_base(ordered_tags)
+    if base is None:
+        print(f"plot_ttfa_trend: skipped ({out_path}), no single combination has >=2 change-tags yet", file=sys.stderr)
+        return
+    tags = ordered_tags[base]
+
+    p50s, p95s = [], []
+    for tag in tags:
+        stage = latency_summary.get(combo_tag_key(base, tag), {}).get("ttfa_s", {})
+        p50s.append(stage.get("p50"))
+        p95s.append(stage.get("p95"))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor(CHART_SURFACE)
+    ax.set_facecolor(CHART_SURFACE)
+
+    ax.plot(tags, p50s, color=COMBO_COLORS[0], linewidth=2, marker="o", label="p50")
+    ax.plot(tags, p95s, color=COMBO_COLORS[0], linewidth=2, linestyle="--", marker="o", label="p95")
+    ax.axhline(1.0, color=MUTED_INK, linestyle="--", linewidth=1)
+    ax.text(0, 1.02, "1.0s target", color=MUTED_INK, fontsize=8)
+
+    ax.set_title(base, color=PRIMARY_INK, fontsize=10)
+    ax.set_ylabel("TTFA (s)", color=MUTED_INK)
     ax.grid(axis="y", color=GRIDLINE, linewidth=1)
     ax.set_axisbelow(True)
     for spine in ("top", "right"):
