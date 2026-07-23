@@ -14,6 +14,7 @@ from benchmarks.eval_latency import (
     group_by_combination_and_tag,
     load_runs,
     load_runs_with_tags,
+    ordered_tags_by_combination,
     parse_change_tag,
     percentile,
     summarize,
@@ -207,3 +208,40 @@ def test_load_runs_with_tags_names_every_untagged_file_when_several_are_missing_
         load_runs_with_tags(str(tmp_path))
     assert "20260722_100000_combo.jsonl" in str(excinfo.value)
     assert "20260722_110000_combo.jsonl" in str(excinfo.value)
+
+
+def test_ordered_tags_by_combination_orders_by_earliest_ts_not_alphabetically():
+    # "stt-lang-temp" sorts before "z-baseline" alphabetically but must
+    # render second, since its records have a later ts.
+    tagged_records = [
+        ("z-baseline", _record(combination_id="combo-a", prompt_version=None, ts=100.0)),
+        ("stt-lang-temp", _record(combination_id="combo-a", prompt_version=None, ts=200.0)),
+        ("z-baseline", _record(combination_id="combo-a", prompt_version=None, ts=101.0)),
+    ]
+
+    ordered = ordered_tags_by_combination(tagged_records)
+
+    assert ordered["combo-a"] == ["z-baseline", "stt-lang-temp"]
+
+
+def test_ordered_tags_by_combination_separates_different_prompt_versions():
+    tagged_records = [
+        ("t1", _record(combination_id="combo-a", prompt_version="v1-concise-en", ts=1.0)),
+        ("t1", _record(combination_id="combo-a", prompt_version="v2-shorter", ts=2.0)),
+    ]
+
+    ordered = ordered_tags_by_combination(tagged_records)
+
+    assert set(ordered) == {"combo-a [prompt=v1-concise-en]", "combo-a [prompt=v2-shorter]"}
+
+
+def test_ordered_tags_by_combination_uses_each_tags_earliest_ts_even_out_of_order():
+    tagged_records = [
+        ("t1", _record(combination_id="combo-a", prompt_version=None, ts=50.0)),
+        ("t2", _record(combination_id="combo-a", prompt_version=None, ts=10.0)),
+        ("t1", _record(combination_id="combo-a", prompt_version=None, ts=5.0)),  # t1's true earliest
+    ]
+
+    ordered = ordered_tags_by_combination(tagged_records)
+
+    assert ordered["combo-a"] == ["t1", "t2"]

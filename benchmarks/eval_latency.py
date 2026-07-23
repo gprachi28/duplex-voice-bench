@@ -105,6 +105,22 @@ def group_by_combination_and_tag(
     return grouped
 
 
+def ordered_tags_by_combination(
+    tagged_records: list[tuple[str, dict]]
+) -> dict[str, list[str]]:
+    """For each combo_base_key(...) value, returns its change-tags ordered
+    by the earliest 'ts' (agent/metrics.py's time.time() capture) seen
+    among that tag's records -- chronological by when the turns actually
+    happened, not alphabetical by tag string."""
+    first_seen: dict[str, dict[str, float]] = defaultdict(dict)
+    for change_tag, record in tagged_records:
+        base = combo_base_key(record.get("combination_id", "unknown"), record.get("prompt_version"))
+        ts = record.get("ts", 0.0)
+        if change_tag not in first_seen[base] or ts < first_seen[base][change_tag]:
+            first_seen[base][change_tag] = ts
+    return {base: sorted(tag_ts, key=tag_ts.get) for base, tag_ts in first_seen.items()}
+
+
 def percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
