@@ -1,8 +1,10 @@
 """Generates PNGs from benchmark results -- see benchmarks/README.md.
 
-Two plots today (one wired combination, single machine):
+Four plots today (one wired combination, single machine):
   - stage_breakdown.png -- p50/p95 per-stage latency, stacked bar per combination
   - ttfa_distribution.png -- TTFA histogram with p50/p95/p99 lines, per combination
+  - ttfa_trend.png -- TTFA p50/p95 across a combination's change-tags, chronological
+  - stage_trend.png -- per-stage p50 stacked area across the same change-tags
 
 The Pareto frontier (accuracy vs p95 TTFA) needs >= 2 combinations with a WER
 axis and isn't here yet -- see design.md's "Benchmark Combinations" section.
@@ -199,8 +201,8 @@ def plot_ttfa_trend(
     p50s, p95s = [], []
     for tag in tags:
         stage = latency_summary.get(combo_tag_key(base, tag), {}).get("ttfa_s", {})
-        p50s.append(stage.get("p50"))
-        p95s.append(stage.get("p95"))
+        p50s.append(stage.get("p50") or 0.0)
+        p95s.append(stage.get("p95") or 0.0)
 
     fig, ax = plt.subplots(figsize=(9, 5))
     fig.patch.set_facecolor(CHART_SURFACE)
