@@ -36,4 +36,12 @@ Entry template:
 - reading: Transcription (STT) still dominates TTFA -- ~63% of the p50 budget -- but with the fix-iteration noise removed, the tail is far tighter (p95 TTFA 3.42s vs. 3.84s pooled, and no more double-digit-second outliers). STT p50 (1.28s) is still 6-16x design.md's projected 80-200ms for `mlx-whisper large-v3` -- that table entry reads as an unvalidated estimate, not a measurement. `tts_first_chunk_s` (p50 0.43s) is ~3x over the 50-150ms Kokoro estimate. p50 TTFA is 2x the <1s target. 7/14 turns (50%) were barge-in interruptions.
 - next: log utterance audio duration per turn (not currently captured) to check whether transcription_s scales with input length -- if so, the fix is capping/chunking audio before STT, not swapping STT models.
 
+## 2026-07-23 -- local-lv3-ollama3b-kokoro -- change-tag trend tracking landed (tooling, no new run)
+- combination_id: mlx-community/whisper-large-v3-mlx|llama3.2:3b|prince-canuma/Kokoro-82M
+- run file: none new -- reuses the two existing runs, renamed with the new `__<change-tag>` suffix: `results/runs/20260722_214718_local-lv3-ollama3b-kokoro__baseline.jsonl` (14 turns) and `results/runs/20260722_223140_local-lv3-ollama3b-kokoro__stt-lang-temp.jsonl` (11 turns).
+- change under test: benchmarking tooling, not the pipeline -- resolves the previous entry's "next" note. `eval_latency.py` now groups by `(combination_id, prompt_version, change_tag)` instead of just the first two, so same-combination runs from different fix iterations split cleanly instead of silently blending; an untagged run file is now a hard error. `plot.py` gained `ttfa_trend.png` and `stage_trend.png`, charting a combination's change-tags in chronological order.
+- result: `ttfa_trend.png`/`stage_trend.png` render the same 2.02s -> 1.39s p50 TTFA drop (and the transcription-stage shrink) the previous entry computed by hand -- confirms the tool's output matches that manual pre/post comparison.
+- reading: the by-hand prose comparison this replaces is no longer needed going forward -- a future fix just needs its run file tagged with a new `__<change-tag>` and the trend renders itself.
+- next: capture the next live session under a new `__<change-tag>` so the trend plots show a third point; the pending turn-state banner and STT-fix live-confirmations already tracked in `experiments.md`/`README.md`'s Known Issues are still open separately.
+
 <!-- Newest entries go above this line. -->
