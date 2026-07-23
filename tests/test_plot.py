@@ -8,6 +8,7 @@ shape/non-emptiness, not pixel content).
 
 from benchmarks.plot import (
     plot_stage_breakdown,
+    plot_stage_trend,
     plot_ttfa_distribution,
     plot_ttfa_trend,
     stage_breakdown_series,
@@ -112,6 +113,31 @@ def test_plot_ttfa_trend_skips_when_multiple_combinations_qualify(tmp_path, caps
     ordered_tags = {"combo-a": ["baseline", "fix1"], "combo-b": ["baseline", "fix1"]}
 
     plot_ttfa_trend(latency_summary, ordered_tags, str(out_path))
+
+    assert not out_path.exists()
+    assert "skipped" in capsys.readouterr().err
+
+
+def test_plot_stage_trend_writes_a_png_when_two_tags_exist(tmp_path):
+    out_path = tmp_path / "stage_trend.png"
+    latency_summary = {
+        "combo-a [baseline]": _summary(transcription_s={"p50": 1.28, "p95": 1.44, "p99": 1.5}),
+        "combo-a [fix1]": _summary(transcription_s={"p50": 0.77, "p95": 1.10, "p99": 1.2}),
+    }
+    ordered_tags = {"combo-a": ["baseline", "fix1"]}
+
+    plot_stage_trend(latency_summary, ordered_tags, str(out_path))
+
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+
+def test_plot_stage_trend_skips_when_only_one_tag_exists(tmp_path, capsys):
+    out_path = tmp_path / "stage_trend.png"
+    latency_summary = {"combo-a [baseline]": _summary()}
+    ordered_tags = {"combo-a": ["baseline"]}
+
+    plot_stage_trend(latency_summary, ordered_tags, str(out_path))
 
     assert not out_path.exists()
     assert "skipped" in capsys.readouterr().err

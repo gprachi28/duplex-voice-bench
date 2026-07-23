@@ -22,7 +22,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from benchmarks.eval_latency import combo_tag_key, group_by_combination_and_tag, load_runs_with_tags, percentile
+from benchmarks.eval_latency import (
+    combo_tag_key,
+    group_by_combination_and_tag,
+    load_runs_with_tags,
+    ordered_tags_by_combination,
+    percentile,
+)
 
 STAGE_LABELS = {
     "end_of_turn_s": "End of turn",
@@ -219,6 +225,51 @@ def plot_ttfa_trend(
     plt.close(fig)
 
 
+def plot_stage_trend(
+    latency_summary: dict[str, dict],
+    ordered_tags: dict[str, list[str]],
+    out_path: str,
+) -> None:
+    base = _single_trend_base(ordered_tags)
+    if base is None:
+        print(f"plot_stage_trend: skipped ({out_path}), no single combination has >=2 change-tags yet", file=sys.stderr)
+        return
+    tags = ordered_tags[base]
+
+    series: dict[str, list[float]] = {stage: [] for stage in STAGE_LABELS}
+    for tag in tags:
+        summary = latency_summary.get(combo_tag_key(base, tag), {})
+        for stage in STAGE_LABELS:
+            value = summary.get(stage, {}).get("p50")
+            series[stage].append(value if value is not None else 0.0)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor(CHART_SURFACE)
+    ax.set_facecolor(CHART_SURFACE)
+
+    x = range(len(tags))
+    ax.stackplot(
+        x,
+        *[series[stage] for stage in STAGE_LABELS],
+        labels=list(STAGE_LABELS.values()),
+        colors=[STAGE_COLORS[stage] for stage in STAGE_LABELS],
+    )
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(tags, color=PRIMARY_INK)
+    ax.set_title(base, color=PRIMARY_INK, fontsize=10)
+    ax.set_ylabel("p50 latency (s)", color=MUTED_INK)
+    ax.grid(axis="y", color=GRIDLINE, linewidth=1)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.tick_params(colors=MUTED_INK)
+    ax.legend(frameon=False, labelcolor=PRIMARY_INK, loc="upper left")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=CHART_SURFACE)
+    plt.close(fig)
+
+
 def main(
     runs_dir: str = "benchmarks/results/runs",
     summary_path: str = "benchmarks/results/latency_summary.json",
@@ -226,11 +277,15 @@ def main(
 ) -> None:
     with open(summary_path) as f:
         latency_summary = json.load(f)
-    grouped_records = group_by_combination_and_tag(load_runs_with_tags(runs_dir))
+    tagged_records = load_runs_with_tags(runs_dir)
+    grouped_records = group_by_combination_and_tag(tagged_records)
+    ordered_tags = ordered_tags_by_combination(tagged_records)
 
     os.makedirs(plots_dir, exist_ok=True)
     plot_stage_breakdown(latency_summary, os.path.join(plots_dir, "stage_breakdown.png"))
     plot_ttfa_distribution(grouped_records, os.path.join(plots_dir, "ttfa_distribution.png"))
+    plot_ttfa_trend(latency_summary, ordered_tags, os.path.join(plots_dir, "ttfa_trend.png"))
+    plot_stage_trend(latency_summary, ordered_tags, os.path.join(plots_dir, "stage_trend.png"))
 
 
 if __name__ == "__main__":
