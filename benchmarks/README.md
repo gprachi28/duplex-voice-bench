@@ -10,10 +10,12 @@ version, paired with the model it was tested against), and
 harness is building toward.
 
 Every turn's metrics record carries both `combination_id` (STT|LLM|TTS) and
-`prompt_version` (`agent/worker.py`'s `SYSTEM_PROMPT_VERSION`), and
-`eval_latency.py` groups by the pair — so a prompt change never gets
-silently pooled with results from a different prompt under the same
-combination.
+`prompt_version` (`agent/worker.py`'s `SYSTEM_PROMPT_VERSION`). A run file's
+name carries a third key, `change_tag` (the `__<change-tag>` suffix — see
+"Running" below), marking which code-state iteration it was captured
+against. `eval_latency.py` groups by all three — so neither a prompt
+change nor a same-day fix iteration ever gets silently pooled with a
+different one under the same combination.
 
 ## Layout
 
@@ -29,7 +31,8 @@ results/
   wer/             WER/MER summaries per run
 plots/             generated PNGs -- committed, these are the artifact
 eval_latency.py    offline analysis: groups results/runs/*.jsonl by
-                   combination_id, computes p50/p95/p99 per pipeline stage
+                   combination_id, prompt_version, and change_tag (parsed
+                   from each filename), computes p50/p95/p99 per stage
 eval_stt.py        WER/MER harness: calls STTBackend.transcribe() directly
                    against datasets/manifest.jsonl (no LiveKit transport)
 plot.py            reads eval_latency.py's output, writes plots/*.png
@@ -62,11 +65,18 @@ for `local-lv3-ollama8b-kokoro` is deferred, not currently a priority.
 
 ```bash
 # after a live session has produced turns in the worker's metrics JSONL:
-cp /tmp/voice-agent-metrics.jsonl benchmarks/results/runs/$(date +%Y%m%d_%H%M%S)_local-lv3-ollama3b-kokoro.jsonl
+cp /tmp/voice-agent-metrics.jsonl benchmarks/results/runs/$(date +%Y%m%d_%H%M%S)_local-lv3-ollama3b-kokoro__<change-tag>.jsonl
 
 python -m benchmarks.eval_latency benchmarks/results/runs
 python -m benchmarks.plot
 ```
+
+`<change-tag>` is a short slug for the code state this run was captured
+against (e.g. `baseline`, `stt-lang-temp`) — every run file must have one,
+`eval_latency.py` raises if it finds one that doesn't. Reuse the same tag
+across repeat sessions of the same code state; give it a new tag once a
+fix lands so the trend plots (`ttfa_trend.png`, `stage_trend.png`) can
+show the before/after.
 
 ## Future / not in scope yet
 
