@@ -9,8 +9,11 @@ import pytest
 
 from benchmarks.eval_latency import (
     STAGES,
+    combo_base_key,
+    combo_tag_key,
     group_by_combination,
     load_runs,
+    load_runs_with_tags,
     parse_change_tag,
     percentile,
     summarize,
@@ -143,3 +146,47 @@ def test_parse_change_tag_raises_when_no_double_underscore():
 
     with pytest.raises(ValueError, match="20260722_223140_local-lv3-ollama3b-kokoro.jsonl"):
         parse_change_tag(path)
+
+
+def test_combo_base_key_includes_prompt_version_when_present():
+    assert combo_base_key("combo-a", "v1-concise-en") == "combo-a [prompt=v1-concise-en]"
+
+
+def test_combo_base_key_omits_prompt_bracket_when_none():
+    assert combo_base_key("combo-a", None) == "combo-a"
+
+
+def test_combo_tag_key_appends_bracketed_tag():
+    assert combo_tag_key("combo-a", "baseline") == "combo-a [baseline]"
+
+
+def test_load_runs_with_tags_pairs_each_record_with_its_file_tag(tmp_path):
+    _write_jsonl(tmp_path / "20260722_100000_combo__baseline.jsonl", [_record(turn_id="a")])
+    _write_jsonl(tmp_path / "20260722_110000_combo__fix1.jsonl", [_record(turn_id="b")])
+
+    tagged = load_runs_with_tags(str(tmp_path))
+
+    tags_by_turn = {record["turn_id"]: tag for tag, record in tagged}
+    assert tags_by_turn == {"a": "baseline", "b": "fix1"}
+
+
+def test_load_runs_with_tags_is_safe_on_an_empty_directory(tmp_path):
+    assert load_runs_with_tags(str(tmp_path)) == []
+
+
+def test_load_runs_with_tags_raises_on_untagged_file_and_names_it(tmp_path):
+    _write_jsonl(tmp_path / "20260722_100000_combo__baseline.jsonl", [_record(turn_id="a")])
+    _write_jsonl(tmp_path / "20260722_110000_combo.jsonl", [_record(turn_id="b")])
+
+    with pytest.raises(ValueError, match="20260722_110000_combo.jsonl"):
+        load_runs_with_tags(str(tmp_path))
+
+
+def test_load_runs_with_tags_names_every_untagged_file_when_several_are_missing_tags(tmp_path):
+    _write_jsonl(tmp_path / "20260722_100000_combo.jsonl", [_record(turn_id="a")])
+    _write_jsonl(tmp_path / "20260722_110000_combo.jsonl", [_record(turn_id="b")])
+
+    with pytest.raises(ValueError) as excinfo:
+        load_runs_with_tags(str(tmp_path))
+    assert "20260722_100000_combo.jsonl" in str(excinfo.value)
+    assert "20260722_110000_combo.jsonl" in str(excinfo.value)

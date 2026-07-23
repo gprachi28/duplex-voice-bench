@@ -41,15 +41,52 @@ def parse_change_tag(path: str) -> str:
     return stem.split("__", 1)[1]
 
 
+def _read_jsonl_file(path: str) -> list[dict]:
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
 def load_runs(runs_dir: str) -> list[dict]:
     records = []
     for path in sorted(glob.glob(os.path.join(runs_dir, "*.jsonl"))):
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
+        records.extend(_read_jsonl_file(path))
     return records
+
+
+def load_runs_with_tags(runs_dir: str) -> list[tuple[str, dict]]:
+    """Like load_runs, but pairs each record with its source file's
+    change_tag (see parse_change_tag). Raises ValueError up front, before
+    returning anything, if any file in runs_dir is untagged -- naming
+    every offending path so a forgotten rename is caught in one pass."""
+    paths = sorted(glob.glob(os.path.join(runs_dir, "*.jsonl")))
+    tags: dict[str, str] = {}
+    untagged: list[str] = []
+    for path in paths:
+        try:
+            tags[path] = parse_change_tag(path)
+        except ValueError:
+            untagged.append(path)
+    if untagged:
+        raise ValueError(
+            "run files missing __<change-tag> suffix: " + ", ".join(untagged)
+        )
+    tagged_records: list[tuple[str, dict]] = []
+    for path in paths:
+        tagged_records.extend((tags[path], record) for record in _read_jsonl_file(path))
+    return tagged_records
+
+
+def combo_base_key(combination_id: str, prompt_version: str | None) -> str:
+    return f"{combination_id} [prompt={prompt_version}]" if prompt_version else combination_id
+
+
+def combo_tag_key(base: str, change_tag: str) -> str:
+    return f"{base} [{change_tag}]"
 
 
 def group_by_combination(records: list[dict]) -> dict[str, list[dict]]:
