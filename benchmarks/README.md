@@ -40,20 +40,22 @@ plot.py            reads eval_latency.py's output, writes plots/*.png
 
 ## Combination IDs
 
-The worker's `COMBINATION_ID` (`agent/worker.py`) is already an honest,
-dynamically-built string: `f"{WHISPER_MODEL}|{OLLAMA_MODEL}|{KOKORO_REPO}"`
-(or the equivalent for whichever backends are wired at the time). The table
-below maps design.md's named combinations to that literal string so logbook
-entries, run filenames, and plots all key on the same identifier.
+Each turn's `combination_id` (`agent/worker.py`'s `_dispatch_gate_result`) is
+built fresh per turn: `f"{WHISPER_MODEL}|{llm_backend.model}|{KOKORO_REPO}"` —
+so it always reflects whichever LLM backend `LLM_BACKEND` actually selected
+that run, not a hardcoded constant. The table below maps design.md's named
+combinations to that literal string so logbook entries, run filenames, and
+plots all key on the same identifier.
 
 | Slug (used in logbook/filenames) | design.md combo | Wired today? |
 |---|---|---|
 | `local-lv3-ollama3b-kokoro` | *(not a design.md combo — actual running stack)* | **Yes** |
 | `local-lv3-ollama8b-kokoro` | #5, Option 1 (full local) | No — 3B is running, not 8B; not currently prioritized |
-| `hybrid-speed` | #1 (tiny + GPT-4o + Kokoro) | No — needs GPT-4o LLM backend |
-| `hybrid-accuracy` | #2, Option 2 (large-v3 + GPT-4o + Kokoro) | No — needs GPT-4o LLM backend |
-| `cloud-stt-local-tts` | #4 (Cohere + GPT-4o + Kokoro) | No — needs Cohere STT + GPT-4o backends |
-| `full-cloud` | #3 (Cohere + GPT-4o + ElevenLabs) | No — needs Cohere STT + GPT-4o + ElevenLabs backends |
+| `hybrid-lv3-gpt4omini-kokoro` | *(not a design.md combo — unofficial faster-LLM variant, see `.env.example`'s `OPENAI_MODEL` note)* | **Yes** — first run 2026-07-24, see logbook.md |
+| `hybrid-speed` | #1 (tiny + GPT-4o + Kokoro) | No — GPT-4o LLM backend now exists (`agent/llm.py`); still needs the STT swap to `tiny` (`WHISPER_MODEL` is `large-v3`) |
+| `hybrid-accuracy` | #2, Option 2 (large-v3 + GPT-4o + Kokoro) | Backend wired, not yet run — `LLM_BACKEND=gpt4o` defaults to `gpt-4o`; only the `gpt-4o-mini` variant above has actually been run live |
+| `cloud-stt-local-tts` | #4 (Cohere + GPT-4o + Kokoro) | No — needs a Cohere STT backend |
+| `full-cloud` | #3 (Cohere + GPT-4o + ElevenLabs) | No — needs Cohere STT + ElevenLabs backends |
 
 **Sequencing:** benchmark the local stack (`local-lv3-ollama3b-kokoro`) first —
 latency baseline, parameter sweeps (Smart Turn threshold, sentence-buffer
