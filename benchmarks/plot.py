@@ -2,7 +2,9 @@
 
 Four plots today (one wired combination, single machine):
   - stage_breakdown.png -- p50/p95 per-stage latency, stacked bar per combination
-  - ttfa_distribution.png -- TTFA histogram with p50/p95/p99 lines, per combination
+  - ttfa_distribution.png -- TTFA strip plot (one row per combination, each
+    turn a dot, p50/p95 marked) -- small multiples instead of overlapping
+    histograms, see plot_ttfa_distribution's docstring for why
   - ttfa_trend.png -- TTFA p50/p95 across a combination's change-tags, chronological
   - stage_trend.png -- per-stage p50 stacked area across the same change-tags
 
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 
 import matplotlib
@@ -133,39 +136,57 @@ def plot_stage_breakdown(latency_summary: dict[str, dict], out_path: str) -> Non
 
 
 def plot_ttfa_distribution(grouped_records: dict[str, list[dict]], out_path: str) -> None:
-    fig, ax = plt.subplots(figsize=(8, 5))
+    """One row per combination: every turn's TTFA as a dot, p50 as a filled
+    diamond, p95 as a tick (skipped if it ties p50 -- common at n<20 with
+    nearest-rank percentiles). Replaces an earlier overlapping-histogram
+    version: combination_id strings are long, so a legend of them overflowed
+    the figure, and histogram bins are noisy at the ~11-17 turns per
+    combination this project runs. Row labels carry identity instead of a
+    legend, the same pattern plot_stage_breakdown already uses."""
+    combos = list(grouped_records)
+    row_span = 0.34
+    row_unit = 1.6  # spacing between row centers -- wide enough that one
+    # row's p95 label and the next row's p50 label never occupy the same y
+
+    fig, ax = plt.subplots(figsize=(9, 0.9 * row_unit * len(combos) + 1.2))
     fig.patch.set_facecolor(CHART_SURFACE)
     ax.set_facecolor(CHART_SURFACE)
 
-    for i, (combo, records) in enumerate(grouped_records.items()):
-        values = sorted(r["ttfa_s"] for r in records if r.get("ttfa_s") is not None)
+    for i, combo in enumerate(combos):
+        y0 = i * row_unit
+        values = sorted(r["ttfa_s"] for r in grouped_records[combo] if r.get("ttfa_s") is not None)
         if not values:
             continue
         color = COMBO_COLORS[i % len(COMBO_COLORS)]
-        ax.hist(
-            values,
-            bins=min(20, max(5, len(values) // 2)),
-            color=color,
-            alpha=0.55,
-            label=combo,
-            edgecolor=CHART_SURFACE,
-        )
-        for q, style in ((0.50, "-"), (0.95, "--"), (0.99, ":")):
-            v = percentile(values, q)
-            if v is not None:
-                ax.axvline(v, color=color, linestyle=style, linewidth=1.5)
+        jitter = random.Random(combo)
+        y = [y0 + jitter.uniform(-row_span, row_span) for _ in values]
+        ax.scatter(values, y, s=70, color=color, edgecolors=CHART_SURFACE, linewidths=1.5, alpha=0.85, zorder=3)
 
+        p50 = percentile(values, 0.50)
+        p95 = percentile(values, 0.95)
+        if p50 is not None:
+            ax.scatter([p50], [y0], marker="D", s=110, color=color, edgecolors=CHART_SURFACE, linewidths=1.5, zorder=4)
+            ax.text(p50, y0 - row_span * 1.35, f"p50 {p50:.2f}s", color=PRIMARY_INK, fontsize=8, ha="center")
+        if p95 is not None and p95 != p50:
+            ax.plot([p95, p95], [y0 - row_span, y0 + row_span], color=color, linewidth=3, zorder=4)
+            ax.text(p95, y0 + row_span * 1.55, f"p95 {p95:.2f}s", color=MUTED_INK, fontsize=8, ha="center")
+
+    ax.set_yticks([i * row_unit for i in range(len(combos))])
+    ax.set_yticklabels(combos, color=PRIMARY_INK, fontsize=8)
+    # Explicit (inverted) limits, not invert_yaxis() on the autoscaled range --
+    # autoscale doesn't reserve room for the top row's p50 label or the
+    # bottom row's p95 label, so both were clipping against the figure edge.
+    ax.set_ylim((len(combos) - 1) * row_unit + row_span * 2.0, -row_span * 2.0)
     ax.set_xlabel("TTFA (s)", color=MUTED_INK)
-    ax.set_ylabel("Turns", color=MUTED_INK)
-    ax.grid(axis="y", color=GRIDLINE, linewidth=1)
+    ax.grid(axis="x", color=GRIDLINE, linewidth=1)
     ax.set_axisbelow(True)
-    for spine in ("top", "right"):
+    for spine in ("top", "right", "left"):
         ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color(MUTED_INK)
     ax.tick_params(colors=MUTED_INK)
-    ax.legend(frameon=False, labelcolor=PRIMARY_INK)
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, facecolor=CHART_SURFACE)
+    fig.savefig(out_path, dpi=150, facecolor=CHART_SURFACE, bbox_inches="tight")
     plt.close(fig)
 
 
