@@ -40,6 +40,8 @@ class FakeSTT:
 
 
 class FakeLLM:
+    model = "fake-llm"
+
     def __init__(
         self,
         chunks: list[str],

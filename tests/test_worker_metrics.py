@@ -11,7 +11,8 @@ import pytest
 
 import agent.worker as worker_module
 from agent.playback import PlaybackState
-from agent.tts import TTSResult, WordTiming
+from agent.stt import WHISPER_MODEL
+from agent.tts import KOKORO_REPO, TTSResult, WordTiming
 from agent.turn_gate import Fire, ForceFire
 from agent.worker import (
     FALLBACK_REPLY,
@@ -30,6 +31,8 @@ class FakeSTT:
 
 
 class FakeLLM:
+    model = "fake-llm"
+
     def __init__(self, chunks: list[str]) -> None:
         self._chunks = chunks
 
@@ -106,8 +109,31 @@ def test_dispatch_with_t0_writes_one_metrics_record(metrics_path):
     assert record["prompt_version"] == worker_module.SYSTEM_PROMPT_VERSION
 
 
+def test_dispatch_combination_id_reflects_llm_backend_model(metrics_path):
+    class TaggedLLM(FakeLLM):
+        model = "gpt-4o-mini"
+
+    asyncio.run(
+        _dispatch_gate_result(
+            Fire(np.zeros(1, dtype=np.float32)),
+            FakeSTT("hi there"),
+            TaggedLLM(["Hello!"]),
+            FakeTTS(),
+            [],
+            asyncio.Lock(),
+            ActiveReply(room="room-1"),
+            FakePump(),
+            t0=100.0,
+        )
+    )
+    record = _read_records(metrics_path)[0]
+    assert record["combination_id"] == f"{WHISPER_MODEL}|gpt-4o-mini|{KOKORO_REPO}"
+
+
 def test_dispatch_on_stt_repetition_loop_skips_llm_and_speaks_fallback(metrics_path):
     class ExplodingLLM:
+        model = "fake-llm"
+
         async def stream_chat(self, messages):
             raise AssertionError("LLM must not be called on a repetition-loop transcript")
             yield  # pragma: no cover -- makes this an async generator

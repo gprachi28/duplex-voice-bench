@@ -29,7 +29,7 @@ from livekit import agents, rtc
 from livekit.agents.vad import VADEventType
 
 from agent.audio import TARGET_SR, to_16k_mono_f32
-from agent.llm import OLLAMA_MODEL, LLMBackend, create_llm_backend
+from agent.llm import LLMBackend, create_llm_backend
 from agent.metrics import DEFAULT_METRICS_LOG_PATH, TurnMetrics, append_turn_metrics
 from agent.playback import PlaybackPump, PlaybackState
 from agent.sentence_buffer import SentenceBuffer
@@ -40,10 +40,6 @@ from agent.turn_gate import Continue, ForceFire, GateResult, TurnGate, create_tu
 from agent.vad import create_vad
 
 METRICS_LOG_PATH = os.environ.get("METRICS_LOG_PATH", DEFAULT_METRICS_LOG_PATH)
-# Static for now -- no runtime backend-switching exists yet, so this always
-# reflects the one hardcoded combination. See design.md's "Benchmark
-# Combinations" table for where this is headed.
-COMBINATION_ID = f"{WHISPER_MODEL}|{OLLAMA_MODEL}|{KOKORO_REPO}"
 
 # Spoken when STT output is a detected repetition loop (see
 # agent/stt.py's is_repetition_loop) -- design.md's "Error recovery"
@@ -744,7 +740,7 @@ async def _dispatch_gate_result(
     metrics = TurnMetrics(
         turn_id=f"{active_reply.room}-{active_reply.turn_count}",
         room=active_reply.room,
-        combination_id=COMBINATION_ID,
+        combination_id=f"{WHISPER_MODEL}|{llm_backend.model}|{KOKORO_REPO}",
         t0=t0,
         forced=forced,
         smart_turn_prob=smart_turn_prob,
