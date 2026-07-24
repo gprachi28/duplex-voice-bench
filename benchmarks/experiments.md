@@ -20,6 +20,41 @@ Entry template:
 
 ---
 
+## 2026-07-24 -- No cloud LLM backend existed: every design.md combination needing GPT-4o was unrunnable
+
+- **symptom**: `benchmarks/README.md`'s combination table listed every
+  hybrid/cloud design.md combination (`hybrid-speed`, `hybrid-accuracy`,
+  `cloud-stt-local-tts`, `full-cloud`) as "No -- needs GPT-4o LLM backend".
+  `agent/llm.py`'s `LLMBackend` was already a `Protocol` in anticipation of
+  a second implementation, but only `OllamaBackend` existed, so no
+  benchmark combination requiring a cloud LLM could be run at all.
+- **root cause**: not a bug -- a planned gap. `create_llm_backend()`
+  unconditionally constructed `OllamaBackend`; there was no branch point
+  for selecting a different backend, and no code called OpenAI's API.
+- **fix**: `agent/llm.py` gained `GPT4oBackend` (streams
+  `openai.AsyncOpenAI().chat.completions.create(..., stream=True)`) and
+  `create_llm_backend()` now branches on an `LLM_BACKEND` env var
+  (`"ollama"`, the default, or `"gpt4o"`), raising if `gpt4o` is selected
+  without `OPENAI_API_KEY` set. `OPENAI_MODEL` optionally overrides the
+  model (defaults to `gpt-4o`; `.env.example` documents `gpt-4o-mini` as an
+  unofficial faster variant). `LLMBackend` gained a `model` attribute so
+  `agent/worker.py`'s `combination_id` (`_dispatch_gate_result`) reflects
+  whichever LLM actually ran instead of the removed `COMBINATION_ID`
+  constant, which hardcoded `OLLAMA_MODEL`.
+- **verification**: `tests/test_llm_backend_selector.py` and
+  `tests/test_llm_gpt4o_backend.py` (new) cover the env-var branch and
+  `GPT4oBackend`'s streaming/error paths; `tests/test_worker_dispatch.py`
+  and `tests/test_worker_metrics.py` updated so fake LLM backends carry a
+  `model` attribute and a new test asserts `combination_id` reflects it.
+  Full suite: 185 passed, 2 skipped, no regressions. Live-verified: a real
+  17-turn LiveKit session with `LLM_BACKEND=gpt4o`/`OPENAI_MODEL=gpt-4o-mini`
+  ran end-to-end with no `LLMBackend` exceptions -- see `logbook.md`'s
+  2026-07-24 `hybrid-lv3-gpt4omini-kokoro` entry for the resulting latency
+  numbers (that run also surfaced a separate finding -- cloud LLM TTFT
+  costing more than it saves at this model size -- logged there, not here,
+  since this file tracks pipeline changes and that file tracks run results).
+- **status**: fixed
+
 ## 2026-07-22 -- STT transcription latency ~2x higher than necessary: language auto-detection on every call
 
 - **symptom**: `benchmarks/logbook.md`'s first baseline capture showed
